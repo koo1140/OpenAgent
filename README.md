@@ -91,7 +91,9 @@ User Input
     ↓
 User Response
 ```
-
+---
+[![Star History Chart](https://api.star-history.com/svg?repos=koo1140/OpenAgent&type=date&legend=top-left)](https://www.star-history.com/#koo1140/OpenAgent&type=date&legend=top-left)
+---
 ## Installation
 
 ```bash
