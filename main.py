@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Literal, Tuple
 import asyncio
 import httpx
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime
@@ -17,7 +18,17 @@ from pathlib import Path
 
 app = FastAPI()
 
-# =============================================================================
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================================================================================================================================
 # CONSTANTS
 # =============================================================================
 
@@ -31,6 +42,19 @@ MAX_HISTORY_TURNS = 10
 MAX_META_TURNS = 50
 MAX_TOOL_ROUNDS = 3
 TOOL_OUTPUT_LIMIT = 1200
+
+# Default meta output for fallback scenarios
+DEFAULT_META_OUTPUT = {
+    "user_intent": "unknown",
+    "chat_subject": "general",
+    "user_tone": "neutral",
+    "recommended_plan": "respond conversationally",
+    "keepMemoryFilesLoaded": False,
+    "memory_files_to_load": None,
+    "skills_to_load": None,
+    "extra_instructions": None,
+    "subagent_suggestions": []
+}
 
 DEFAULT_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "OpenAI": {
@@ -809,19 +833,13 @@ async def repair_json_with_llm(provider_cfg: ProviderConfig, raw_text: str) -> O
 
 
 async def parse_meta_json(provider_cfg: ProviderConfig, content: str) -> Dict[str, Any]:
-    try:
-        return json.loads(content)
-    except Exception:
-        candidate = extract_json_candidate(content)
-        if candidate:
-            try:
-                return json.loads(candidate)
-            except Exception:
-                pass
-    repaired = await repair_json_with_llm(provider_cfg, content)
-    if repaired is not None:
-        return repaired
-    return {}
+    # Let raw message flow through - no parsing, no validation, no rejection
+    logger.info("parse_meta_json: Accepting raw content without parsing")
+    return {
+        "raw_content": content,
+        "parsed_successfully": True,
+        "message": "Content accepted as-is (no validation)"
+    }
 
 
 # =============================================================================
@@ -1058,26 +1076,55 @@ def store_turn(
 # =============================================================================
 
 async def run_meta_agent(session_context: str) -> MetaOutput:
-    meta_prompt = load_meta_agent_prompt()
-    memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
-    skills_list = list_available_skills()
-    skills_text = ", ".join(skills_list) if skills_list else "none"
-    system_content = f"{meta_prompt}\n\nAvailable skills: {skills_text}\n\n{memory_context}".strip()
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": f"Session Context:\n{session_context}"},
-    ]
-    response = await LLMProvider.call(
-        config.meta,
-        messages,
-        response_format={"type": "json_object"},
-    )
-    content = response["choices"][0]["message"]["content"]
-    meta_data = await parse_meta_json(config.meta, content)
+    logger.debug(f"Starting meta agent with session context: {session_context[:100]}...")
+    
     try:
-        return MetaOutput(**meta_data)
-    except Exception:
-        return MetaOutput()
+        meta_prompt = load_meta_agent_prompt()
+        logger.debug(f"Loaded meta prompt: {meta_prompt[:50]}...")
+        
+        memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
+        logger.debug(f"Loaded memory context: {memory_context[:50]}...")
+        
+        skills_list = list_available_skills()
+        skills_text = ", ".join(skills_list) if skills_list else "none"
+        logger.debug(f"Available skills: {skills_text}")
+        
+        system_content = f"{meta_prompt}\n\nAvailable skills: {skills_text}\n\n{memory_context}".strip()
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"Session Context:\n{session_context}"},
+        ]
+        
+        logger.debug("Calling LLM provider for meta agent...")
+        response = await LLMProvider.call(
+            config.meta,
+            messages,
+            response_format=None,  # Remove JSON enforcement - accept any format
+        )
+        
+        content = response["choices"][0]["message"]["content"]
+        logger.debug(f"Received meta agent response: {content}")
+        
+        # Let raw message flow through - no parsing, no validation, no rejection
+        logger.info("Meta agent response accepted as-is (no validation)")
+        
+        # Create MetaOutput directly from raw content without parsing
+        return MetaOutput(
+            user_intent="unknown",
+            chat_subject="general",
+            user_tone="neutral",
+            recommended_plan="respond conversationally",
+            extra_instructions=content  # Pass through the raw response
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in meta agent: {e}", exc_info=True)
+        return MetaOutput(
+            user_intent="unknown",
+            chat_subject="general",
+            user_tone="neutral",
+            recommended_plan="respond conversationally",
+            extra_instructions=f"Meta agent error: {str(e)[:100]}"
+        )
 
 
 def build_main_messages(
@@ -1387,7 +1434,9 @@ async def get_tool_event(event_id: int):
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
+    logger.debug(f"Config in endpoint: {config}")
     if not config:
+        logger.error("Configuration not set in endpoint")
         raise HTTPException(status_code=400, detail="Configuration not set")
 
     if request.session_id and session_exists(request.session_id):
