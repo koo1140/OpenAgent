@@ -30,7 +30,7 @@ Three core memory files evolve through interactions:
 Memory loading is intelligent - files are only loaded when context requires them, saving tokens and improving performance.
 
 ### 🔧 Universal LLM Provider Support
-Supports any OpenAI-compatible API plus Anthropic:
+Supports OpenAI-compatible APIs plus Anthropic:
 - Groq
 - OpenAI
 - Mistral
@@ -38,7 +38,6 @@ Supports any OpenAI-compatible API plus Anthropic:
 - Together AI
 - OpenRouter
 - DeepSeek
-- Google
 - Custom endpoints
 
 ### 🛠️ Powerful Tool System
@@ -48,6 +47,16 @@ Built-in tools for real work:
 - **edit_file** - Create/modify files
 - **regex_search** - Search text in files and directories
 - **curl_request** - HTTP requests with full control
+
+### 🗂️ Persistent Sessions
+- Session list with resume/rename/delete
+- SQLite-backed history for persistent chats
+- Temporary chats that don’t persist
+
+### 🔒 Tool Approval
+- Shell commands require explicit approval
+- Approve once, always allow for session, or deny
+- Tool output is truncated in UI with on-demand full view
 
 ### 🎯 Sub-Agent Orchestration
 Complex tasks can be split across specialized sub-agents with:
@@ -138,18 +147,33 @@ Example configuration:
 {
   "meta": {
     "provider": "Groq",
+    "provider_type": "openai_compatible",
     "model": "mixtral-8x7b-32768",
-    "api_key": "your-groq-key"
+    "api_key": "your-groq-key",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   },
   "main": {
     "provider": "Anthropic",
+    "provider_type": "anthropic",
     "model": "claude-sonnet-4-20250514",
-    "api_key": "your-anthropic-key"
+    "api_key": "your-anthropic-key",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   },
   "sub": {
     "provider": "Groq",
+    "provider_type": "openai_compatible",
     "model": "llama3-70b-8192",
-    "api_key": "your-groq-key"
+    "api_key": "your-groq-key",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   }
 }
 ```
@@ -395,9 +419,11 @@ agentic-gateway/
 ├── index.html             # Frontend interface
 ├── requirements.txt       # Python dependencies
 ├── config.json           # Saved provider configuration
+├── sessions.db           # SQLite session storage
 ├── prompts/
 │   ├── meta_agent.txt    # Meta Agent instructions
 │   └── main_agent.txt    # Main Agent instructions
+├── skills/               # Optional skill files
 └── memory/
     ├── identity.md       # Assistant's core identity
     ├── soul.md          # Philosophical purpose
@@ -406,37 +432,81 @@ agentic-gateway/
 
 ## API Endpoints
 
+### GET /api/providers
+Returns provider registry (base URL + tool support).
+
+### GET /api/config
+Load saved provider configuration.
+
 ### POST /api/config
-Save LLM provider configuration
+Save LLM provider configuration.
+
+### GET /api/sessions
+List persistent sessions.
+
+### POST /api/sessions
+Create a session.
 ```json
-{
-  "meta": {...},
-  "main": {...},
-  "sub": {...}
-}
+{ "title": "My chat", "persistent": true }
 ```
 
+### GET /api/sessions/{id}
+Load a session with turns.
+
+### PATCH /api/sessions/{id}
+Rename a session.
+
+### DELETE /api/sessions/{id}
+Delete a session.
+
 ### POST /api/chat
-Send a message
+Send a message.
 ```json
 {
-  "message": "user message here"
+  "message": "user message here",
+  "session_id": "uuid"
 }
 ```
 
 Returns:
 ```json
 {
-  "reply": "assistant response"
+  "reply": "assistant response",
+  "meta": {...},
+  "tool_events": [...],
+  "subagent_outputs": [...],
+  "status": "ok | needs_approval",
+  "pending_tools": [...],
+  "session_id": "uuid"
+}
+```
+
+### POST /api/tools/approve
+Approve shell_command tool calls.
+```json
+{
+  "session_id": "uuid",
+  "decision": "run_once | allow_session | deny"
 }
 ```
 
 ## Provider Configuration
 
+Common fields:
+- `provider`
+- `provider_type` (`openai_compatible` or `anthropic`)
+- `model`
+- `api_key`
+- `base_url` (optional override)
+- `headers` (optional extra HTTP headers)
+- `supports_tools` (optional override)
+- `supports_response_format` (optional override)
+
 ### Groq
 ```json
 {
   "provider": "Groq",
+  "provider_type": "openai_compatible",
   "model": "mixtral-8x7b-32768",
   "api_key": "gsk_..."
 }
@@ -446,6 +516,7 @@ Returns:
 ```json
 {
   "provider": "OpenAI",
+  "provider_type": "openai_compatible",
   "model": "gpt-4-turbo-preview",
   "api_key": "sk-..."
 }
@@ -455,6 +526,7 @@ Returns:
 ```json
 {
   "provider": "Anthropic",
+  "provider_type": "anthropic",
   "model": "claude-sonnet-4-20250514",
   "api_key": "sk-ant-..."
 }
@@ -463,10 +535,14 @@ Returns:
 ### Custom Endpoint
 ```json
 {
-  "provider": "OpenAI",
+  "provider": "Custom",
+  "provider_type": "openai_compatible",
   "model": "custom-model",
   "api_key": "your-key",
-  "base_url": "https://your-endpoint.com/v1/chat/completions"
+  "base_url": "https://your-endpoint.com/v1/chat/completions",
+  "headers": {
+    "X-Project": "my-app"
+  }
 }
 ```
 
@@ -528,6 +604,10 @@ Edit the prompt files to change behavior:
 - Check file paths are correct
 - Verify permissions for shell commands
 - Large files may be truncated (>200 lines)
+
+### Tool approval required
+- When a tool call includes `shell_command`, the UI will ask for approval
+- Choose Run once, Always allow this session, or Deny (manual steps)
 
 ### Memory files not loading
 - Check `keepMemoryFilesLoaded` in Meta Agent output

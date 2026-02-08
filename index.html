@@ -33,7 +33,7 @@ body{
   flex:1;
   display:none;
   flex-direction:column;
-  max-width:1000px;
+  max-width:1200px;
   margin:auto;
   width:100%;
 }
@@ -45,6 +45,69 @@ header{
   font-weight:600;
   color:var(--accent);
   letter-spacing:.6px;
+}
+
+#mainLayout{
+  flex:1;
+  display:flex;
+  gap:16px;
+  padding:0 18px 18px;
+}
+
+#sessionsPanel{
+  width:260px;
+  background:var(--panel);
+  border-radius:var(--radius);
+  padding:14px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+.panel-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  font-weight:600;
+  color:var(--accent);
+}
+
+.session-create{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+
+.session-item{
+  background:var(--soft);
+  padding:10px;
+  border-radius:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+
+.session-item.active{
+  outline:1px solid var(--accent);
+}
+
+.session-actions{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+
+.session-actions button{
+  padding:6px 10px;
+  border-radius:10px;
+  font-size:12px;
+}
+
+#chatArea{
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  background:transparent;
 }
 
 .chat{
@@ -85,6 +148,45 @@ header{
   padding:10px;
   border-radius:12px;
   overflow:auto;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+
+.details{
+  margin-top:10px;
+  background:#1f201b;
+  border-radius:12px;
+  padding:8px 10px;
+  font-size:12px;
+}
+
+.details summary{
+  cursor:pointer;
+  color:var(--accent);
+  font-weight:600;
+}
+
+.details pre{
+  background:#151612;
+  padding:8px;
+  border-radius:10px;
+  overflow:auto;
+  margin-top:8px;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+
+.tool-event{
+  background:#1b1c19;
+  border-radius:10px;
+  padding:8px;
+  margin-top:8px;
+}
+
+.tool-event .tool-title{
+  font-weight:600;
+  color:var(--accent);
+  margin-bottom:6px;
 }
 
 .input-area{
@@ -92,6 +194,7 @@ header{
   background:var(--panel);
   display:flex;
   gap:10px;
+  border-radius:var(--radius);
 }
 
 textarea{
@@ -120,6 +223,12 @@ button{
 }
 button:hover{opacity:.85}
 
+button.small{
+  padding:6px 10px;
+  border-radius:10px;
+  font-size:12px;
+}
+
 .nav{
   height:60px;
   background:var(--panel);
@@ -135,7 +244,6 @@ button:hover{opacity:.85}
 }
 
 /* Thinking animation */
-
 .thinking{
   display:flex;
   gap:6px;
@@ -165,7 +273,19 @@ button:hover{opacity:.85}
   padding:10px;
   text-align:center;
   font-size:13px;
+  border-radius:12px;
+  margin:0 18px 8px;
 }
+
+.progress{
+  background:var(--soft);
+  color:var(--muted);
+  padding:8px 12px;
+  border-radius:12px;
+  margin:0 18px 8px;
+  font-size:12px;
+}
+.progress.hidden{display:none}
 
 .settings{
   padding:20px;
@@ -189,18 +309,67 @@ button:hover{opacity:.85}
   font-weight:600;
 }
 
-input,select{
+input,select,textarea.small{
   background:var(--soft);
   border:none;
   padding:10px;
   border-radius:12px;
   color:var(--text);
+  width:100%;
+  max-width:100%;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+select{
+  white-space:nowrap;
+}
+
+textarea.small{
+  min-height:60px;
 }
 
 small{color:var(--muted)}
 
-@media(min-width:800px){
-  body{align-items:center}
+.row{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+.row label{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  color:var(--muted);
+}
+
+/* Modal */
+.modal{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.6);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:1000;
+}
+.modal.hidden{display:none}
+.modal-content{
+  background:var(--panel);
+  padding:20px;
+  border-radius:18px;
+  max-width:520px;
+  width:92%;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+
+@media(max-width:900px){
+  #mainLayout{flex-direction:column}
+  #sessionsPanel{width:100%}
 }
 </style>
 </head>
@@ -208,11 +377,32 @@ small{color:var(--muted)}
 
 <div id="chatPage" class="page active">
   <header>OpenAgent</header>
-  <div id="errorBox"></div>
-  <div id="chat" class="chat"></div>
-  <div class="input-area">
-    <textarea id="input"></textarea>
-    <button onclick="handleSend()">Send</button>
+  <div id="mainLayout">
+    <aside id="sessionsPanel">
+      <div class="panel-header">
+        <div>Sessions</div>
+        <button class="small" onclick="refreshSessions()">Refresh</button>
+      </div>
+      <div class="session-create">
+        <input id="newSessionTitle" placeholder="New chat title">
+        <label class="row">
+          <input type="checkbox" id="newSessionTemp">
+          <span>Temporary chat</span>
+        </label>
+        <button onclick="createSession()">New Chat</button>
+      </div>
+      <div id="sessionsList"></div>
+    </aside>
+
+    <section id="chatArea">
+      <div id="errorBox"></div>
+      <div id="progressBox" class="progress hidden"></div>
+      <div id="chat" class="chat"></div>
+      <div class="input-area">
+        <textarea id="input"></textarea>
+        <button onclick="handleSend()">Send</button>
+      </div>
+    </section>
   </div>
 </div>
 
@@ -223,52 +413,43 @@ small{color:var(--muted)}
     <div class="agent-card">
       <div class="agent-title">Meta Agent</div>
       <small>Fast & cheap model for analysis</small>
-      <select id="meta_provider">
-        <option>Groq</option>
-        <option>OpenAI</option>
-        <option>Mistral</option>
-        <option>Anthropic</option>
-        <option>Together</option>
-        <option>OpenRouter</option>
-        <option>DeepSeek</option>
-        <option>Google</option>
-      </select>
+      <select id="meta_provider"></select>
       <input id="meta_model" placeholder="Model ID (e.g., mixtral-8x7b-32768)">
       <input id="meta_key" type="password" placeholder="API Key">
+      <input id="meta_base_url" placeholder="Base URL (optional)">
+      <textarea id="meta_headers" class="small" placeholder='Headers JSON (optional)'></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="meta_supports_tools"> Supports Tools</label>
+        <label><input type="checkbox" id="meta_supports_json"> Supports JSON Output</label>
+      </div>
     </div>
 
     <div class="agent-card">
       <div class="agent-title">Main Agent</div>
       <small>Smart model for user interaction & tools</small>
-      <select id="main_provider">
-        <option>Groq</option>
-        <option>OpenAI</option>
-        <option>Mistral</option>
-        <option>Anthropic</option>
-        <option>Together</option>
-        <option>OpenRouter</option>
-        <option>DeepSeek</option>
-        <option>Google</option>
-      </select>
+      <select id="main_provider"></select>
       <input id="main_model" placeholder="Model ID (e.g., claude-sonnet-4-20250514)">
       <input id="main_key" type="password" placeholder="API Key">
+      <input id="main_base_url" placeholder="Base URL (optional)">
+      <textarea id="main_headers" class="small" placeholder='Headers JSON (optional)'></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="main_supports_tools"> Supports Tools</label>
+        <label><input type="checkbox" id="main_supports_json"> Supports JSON Output</label>
+      </div>
     </div>
 
     <div class="agent-card">
       <div class="agent-title">Sub Agents</div>
       <small>Fast model for specialized tasks</small>
-      <select id="sub_provider">
-        <option>Groq</option>
-        <option>OpenAI</option>
-        <option>Mistral</option>
-        <option>Anthropic</option>
-        <option>Together</option>
-        <option>OpenRouter</option>
-        <option>DeepSeek</option>
-        <option>Google</option>
-      </select>
+      <select id="sub_provider"></select>
       <input id="sub_model" placeholder="Model ID (e.g., llama3-70b-8192)">
       <input id="sub_key" type="password" placeholder="API Key">
+      <input id="sub_base_url" placeholder="Base URL (optional)">
+      <textarea id="sub_headers" class="small" placeholder='Headers JSON (optional)'></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="sub_supports_tools"> Supports Tools</label>
+        <label><input type="checkbox" id="sub_supports_json"> Supports JSON Output</label>
+      </div>
     </div>
 
     <button onclick="saveConfig()">Save Configuration</button>
@@ -281,7 +462,30 @@ small{color:var(--muted)}
   <button id="navSettings" onclick="showPage('settings')">Settings</button>
 </div>
 
+<div id="toolModal" class="modal hidden">
+  <div class="modal-content">
+    <div class="agent-title">Tool approval required</div>
+    <div id="pendingToolsList"></div>
+    <div class="row">
+      <button onclick="approveTools('run_once')">Run once</button>
+      <button onclick="approveTools('allow_session')">Always allow this session</button>
+      <button onclick="approveTools('deny')">Deny (tell me what to do instead)</button>
+    </div>
+  </div>
+</div>
+
 <script>
+let currentSessionId = null;
+let sessionsCache = [];
+let tempSessions = [];
+let providers = {};
+let pendingMeta = null;
+let pendingToolEvents = [];
+let pendingSubagents = [];
+let liveToolEvents = [];
+let liveSubagents = [];
+let liveMessageDiv = null;
+
 function showPage(p){
   chatPage.classList.remove("active");
   settingsPage.classList.remove("active");
@@ -296,12 +500,69 @@ function showPage(p){
   }
 }
 
-function addMessage(content,role){
+function addMessage(content, role){
   const div=document.createElement("div");
   div.className="message "+role;
-  div.innerHTML = role==="assistant" ? marked.parse(content) : content;
+  div.innerHTML = role==="assistant" ? marked.parse(content || "") : (content || "");
   chat.appendChild(div);
   div.scrollIntoView();
+  return div;
+}
+
+function addAssistantMessage(content, meta, toolEvents, subagents){
+  const div = addMessage(content, "assistant");
+  if(meta){
+    const details = document.createElement("details");
+    details.className = "details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Meta";
+    details.appendChild(summary);
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(meta, null, 2);
+    details.appendChild(pre);
+    div.appendChild(details);
+  }
+  if(toolEvents && toolEvents.length){
+    const details = document.createElement("details");
+    details.className = "details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Tools";
+    details.appendChild(summary);
+    toolEvents.forEach(ev => {
+      const block = document.createElement("div");
+      block.className = "tool-event";
+      const title = document.createElement("div");
+      title.className = "tool-title";
+      title.textContent = `${ev.name} (${ev.status})`;
+      const args = document.createElement("pre");
+      args.textContent = JSON.stringify(ev.args || {}, null, 2);
+      const result = document.createElement("pre");
+      result.textContent = ev.result || "";
+      block.appendChild(title);
+      block.appendChild(args);
+      block.appendChild(result);
+      if(ev.id && (ev.result || "").includes("truncated")){
+        const btn = document.createElement("button");
+        btn.className = "small";
+        btn.textContent = "Show full output";
+        btn.onclick = () => fetchFullToolOutput(ev.id, result);
+        block.appendChild(btn);
+      }
+      details.appendChild(block);
+    });
+    div.appendChild(details);
+  }
+  if(subagents && subagents.length){
+    const details = document.createElement("details");
+    details.className = "details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Subagents";
+    details.appendChild(summary);
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(subagents, null, 2);
+    details.appendChild(pre);
+    div.appendChild(details);
+  }
 }
 
 function showThinking(){
@@ -322,34 +583,231 @@ function showError(msg){
   setTimeout(()=>errorBox.innerHTML="",4000);
 }
 
-async function saveConfig(){
-  try{
-    const res=await fetch("/api/config",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        meta:{
-          provider:meta_provider.value,
-          model:meta_model.value,
-          api_key:meta_key.value
-        },
-        main:{
-          provider:main_provider.value,
-          model:main_model.value,
-          api_key:main_key.value
-        },
-        sub:{
-          provider:sub_provider.value,
-          model:sub_model.value,
-          api_key:sub_key.value
-        }
-      })
+function showProgress(stage){
+  if(!stage){
+    progressBox.classList.add("hidden");
+    progressBox.textContent = "";
+    return;
+  }
+  progressBox.textContent = `Stage: ${stage}`;
+  progressBox.classList.remove("hidden");
+}
+
+function startLiveMessage(){
+  liveToolEvents = [];
+  liveSubagents = [];
+  liveMessageDiv = addMessage("", "assistant");
+  liveMessageDiv.innerHTML = "<div class=\"live-text\">Working...</div><div class=\"live-details\"></div>";
+}
+
+function updateLiveDetails(){
+  if(!liveMessageDiv) return;
+  const container = liveMessageDiv.querySelector(".live-details");
+  if(!container) return;
+  container.innerHTML = "";
+  if(liveToolEvents.length){
+    const details = document.createElement("details");
+    details.className = "details";
+    details.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = "Tools";
+    details.appendChild(summary);
+    liveToolEvents.forEach(ev => {
+      const block = document.createElement("div");
+      block.className = "tool-event";
+      const title = document.createElement("div");
+      title.className = "tool-title";
+      title.textContent = `${ev.name} (${ev.status || "running"})`;
+      block.appendChild(title);
+      if(ev.args){
+        const args = document.createElement("pre");
+        args.textContent = JSON.stringify(ev.args, null, 2);
+        block.appendChild(args);
+      }
+      if(ev.result){
+        const result = document.createElement("pre");
+        result.textContent = ev.result;
+        block.appendChild(result);
+      }
+      details.appendChild(block);
     });
-    if(!res.ok) throw new Error("Failed to save config");
-    showPage("chat");
+    container.appendChild(details);
+  }
+  if(liveSubagents.length){
+    const details = document.createElement("details");
+    details.className = "details";
+    details.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = "Subagents";
+    details.appendChild(summary);
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(liveSubagents, null, 2);
+    details.appendChild(pre);
+    container.appendChild(details);
+  }
+}
+
+function finalizeAssistantMessage(content, meta, toolEvents, subagents){
+  const finalMeta = pendingMeta || meta || null;
+  pendingMeta = null;
+  pendingToolEvents = [];
+  pendingSubagents = [];
+  if(liveMessageDiv){
+    liveMessageDiv.remove();
+    liveMessageDiv = null;
+  }
+  addAssistantMessage(content || "", finalMeta, toolEvents || [], subagents || []);
+  showProgress(null);
+}
+
+async function fetchFullToolOutput(id, target){
+  try{
+    const res = await fetch(`/api/tool_events/${id}`);
+    if(!res.ok) throw new Error("Failed to load tool output");
+    const data = await res.json();
+    target.textContent = data.result || "";
   }catch(err){
     showError(err.message);
   }
+}
+
+function renderSessions(){
+  sessionsList.innerHTML = "";
+  const allSessions = [...tempSessions, ...sessionsCache];
+  allSessions.forEach(sess => {
+    const item = document.createElement("div");
+    item.className = "session-item" + (sess.id === currentSessionId ? " active" : "");
+    const title = document.createElement("div");
+    title.textContent = sess.title || "Untitled";
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    const openBtn = document.createElement("button");
+    openBtn.className = "small";
+    openBtn.textContent = "Open";
+    openBtn.onclick = () => openSession(sess.id);
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "small";
+    renameBtn.textContent = "Rename";
+    renameBtn.onclick = () => renameSession(sess.id);
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "small";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.onclick = () => deleteSession(sess.id);
+    actions.appendChild(openBtn);
+    actions.appendChild(renameBtn);
+    actions.appendChild(deleteBtn);
+    item.appendChild(title);
+    item.appendChild(actions);
+    sessionsList.appendChild(item);
+  });
+}
+
+async function refreshSessions(){
+  try{
+    const res = await fetch("/api/sessions");
+    if(!res.ok) throw new Error("Failed to load sessions");
+    sessionsCache = await res.json();
+    renderSessions();
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+async function createSession(){
+  const title = newSessionTitle.value.trim() || "New chat";
+  const persistent = !newSessionTemp.checked;
+  try{
+    const res = await fetch("/api/sessions",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({title, persistent})
+    });
+    if(!res.ok) throw new Error("Failed to create session");
+    const data = await res.json();
+    if(!data.persistent){
+      tempSessions.unshift(data);
+    }else{
+      sessionsCache.unshift(data);
+    }
+    currentSessionId = data.id;
+    chat.innerHTML = "";
+    renderSessions();
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+async function openSession(id){
+  try{
+    const res = await fetch(`/api/sessions/${id}`);
+    if(!res.ok) throw new Error("Failed to load session");
+    const data = await res.json();
+    currentSessionId = data.id;
+    chat.innerHTML = "";
+    (data.turns || []).forEach(turn => {
+      if(turn.user_message) addMessage(turn.user_message, "user");
+      addAssistantMessage(turn.assistant_reply || "", turn.meta, turn.tool_events, turn.subagent_outputs);
+    });
+    renderSessions();
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+async function renameSession(id){
+  const title = prompt("New session title?");
+  if(!title) return;
+  try{
+    if(tempSessions.find(s => s.id === id)){
+      tempSessions = tempSessions.map(s => s.id === id ? {...s, title} : s);
+      renderSessions();
+      return;
+    }
+    const res = await fetch(`/api/sessions/${id}`,{
+      method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({title})
+    });
+    if(!res.ok) throw new Error("Rename failed");
+    sessionsCache = sessionsCache.map(s => s.id === id ? {...s, title} : s);
+    renderSessions();
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+async function deleteSession(id){
+  if(!confirm("Delete this session?")) return;
+  try{
+    if(tempSessions.find(s => s.id === id)){
+      tempSessions = tempSessions.filter(s => s.id !== id);
+      if(currentSessionId === id){
+        currentSessionId = null;
+        chat.innerHTML = "";
+      }
+      renderSessions();
+      return;
+    }
+    const res = await fetch(`/api/sessions/${id}`,{method:"DELETE"});
+    if(!res.ok) throw new Error("Delete failed");
+    sessionsCache = sessionsCache.filter(s => s.id !== id);
+    if(currentSessionId === id){
+      currentSessionId = null;
+      chat.innerHTML = "";
+    }
+    renderSessions();
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+async function ensureCurrentSession(){
+  if(currentSessionId) return;
+  if(sessionsCache.length){
+    openSession(sessionsCache[0].id);
+    return;
+  }
+  await createSession();
 }
 
 async function handleSend(){
@@ -358,18 +816,269 @@ async function handleSend(){
   input.value="";
   addMessage(text,"user");
   showThinking();
+  pendingMeta = null;
+  pendingToolEvents = [];
+  pendingSubagents = [];
   try{
-    const res=await fetch("/api/chat",{
+    if(!currentSessionId){
+      await createSession();
+    }
+    const res=await fetch("/api/chat/stream",{
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:text})
+      body:JSON.stringify({message:text, session_id: currentSessionId})
     });
     if(!res.ok) throw new Error("Backend error");
-    const data=await res.json();
     removeThinking();
-    addMessage(data.reply,"assistant");
+    startLiveMessage();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      buffer += decoder.decode(value, {stream:true});
+      buffer = processSSEBuffer(buffer);
+    }
   }catch(err){
     removeThinking();
+    showProgress(null);
+    if(liveMessageDiv){
+      liveMessageDiv.remove();
+      liveMessageDiv = null;
+    }
+    showError(err.message);
+  }
+}
+
+function processSSEBuffer(buffer){
+  const parts = buffer.split("\n\n");
+  buffer = parts.pop();
+  parts.forEach(chunk => handleSSEChunk(chunk));
+  return buffer;
+}
+
+function handleSSEChunk(chunk){
+  let eventType = "message";
+  let dataStr = "";
+  chunk.split("\n").forEach(line => {
+    if(line.startsWith("event:")){
+      eventType = line.slice(6).trim();
+    }else if(line.startsWith("data:")){
+      dataStr += line.slice(5).trim();
+    }
+  });
+  if(!dataStr) return;
+  let payload = null;
+  try{
+    payload = JSON.parse(dataStr);
+  }catch(err){
+    return;
+  }
+  handleSSEEvent(eventType, payload);
+}
+
+function handleSSEEvent(eventType, payload){
+  if(eventType === "stage"){
+    const name = payload.name || "";
+    const map = {
+      "meta_start": "Meta",
+      "subagents_start": "Subagents",
+      "tools_start": "Tools"
+    };
+    showProgress(map[name] || name);
+    return;
+  }
+  if(eventType === "meta"){
+    pendingMeta = payload;
+    return;
+  }
+  if(eventType === "tool_call"){
+    liveToolEvents.push({name: payload.name, args: payload.args, status: "running"});
+    updateLiveDetails();
+    return;
+  }
+  if(eventType === "tool_result"){
+    liveToolEvents.push({name: payload.name, status: payload.status, result: payload.result});
+    updateLiveDetails();
+    return;
+  }
+  if(eventType === "subagent"){
+    liveSubagents.push(payload);
+    updateLiveDetails();
+    return;
+  }
+  if(eventType === "needs_approval"){
+    pendingMeta = payload.meta || pendingMeta;
+    pendingToolEvents = payload.tool_events || [];
+    pendingSubagents = payload.subagent_outputs || [];
+    if(payload.session_id){
+      currentSessionId = payload.session_id;
+    }
+    if(liveMessageDiv){
+      liveMessageDiv.remove();
+      liveMessageDiv = null;
+    }
+    showToolApproval(payload.pending_tools || []);
+    addAssistantMessage("Tool approval required.", null, payload.tool_events, payload.subagent_outputs);
+    showProgress(null);
+    return;
+  }
+  if(eventType === "assistant"){
+    if(payload.session_id){
+      currentSessionId = payload.session_id;
+    }
+    finalizeAssistantMessage(payload.content, payload.meta, payload.tool_events, payload.subagent_outputs);
+    return;
+  }
+  if(eventType === "done"){
+    showProgress(null);
+  }
+}
+
+function showToolApproval(pendingTools){
+  pendingToolsList.innerHTML = "";
+  pendingTools.forEach(t => {
+    const div = document.createElement("div");
+    div.className = "tool-event";
+    const title = document.createElement("div");
+    title.className = "tool-title";
+    title.textContent = `${t.name}`;
+    const args = document.createElement("pre");
+    args.textContent = typeof t.arguments === "string" ? t.arguments : JSON.stringify(t.arguments || {}, null, 2);
+    div.appendChild(title);
+    div.appendChild(args);
+    pendingToolsList.appendChild(div);
+  });
+  toolModal.classList.remove("hidden");
+}
+
+function hideToolApproval(){
+  toolModal.classList.add("hidden");
+}
+
+async function approveTools(decision){
+  hideToolApproval();
+  showThinking();
+  try{
+    const res = await fetch("/api/tools/approve",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session_id: currentSessionId, decision})
+    });
+    if(!res.ok) throw new Error("Approval failed");
+    const data = await res.json();
+    removeThinking();
+    if(data.status === "needs_approval"){
+      pendingMeta = data.meta || pendingMeta;
+      pendingToolEvents = data.tool_events || [];
+      pendingSubagents = data.subagent_outputs || [];
+      showToolApproval(data.pending_tools || []);
+      addAssistantMessage("Tool approval required.", null, data.tool_events, data.subagent_outputs);
+      return;
+    }
+    if(data.session_id){
+      currentSessionId = data.session_id;
+    }
+    finalizeAssistantMessage(data.reply || "", data.meta, data.tool_events, data.subagent_outputs);
+  }catch(err){
+    removeThinking();
+    showError(err.message);
+  }
+}
+
+async function loadProviders(){
+  try{
+    const res = await fetch("/api/providers");
+    if(!res.ok) throw new Error("Failed to load providers");
+    providers = await res.json();
+    const providerNames = Object.keys(providers);
+    ["meta","main","sub"].forEach(prefix => {
+      const select = document.getElementById(`${prefix}_provider`);
+      select.innerHTML = "";
+      providerNames.forEach(name => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      });
+      select.onchange = () => applyProviderDefaults(prefix, select.value);
+      applyProviderDefaults(prefix, select.value);
+    });
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+function applyProviderDefaults(prefix, providerName){
+  const def = providers[providerName];
+  if(!def) return;
+  const baseUrlInput = document.getElementById(`${prefix}_base_url`);
+  if(!baseUrlInput.value){
+    baseUrlInput.value = def.base_url || "";
+  }
+  document.getElementById(`${prefix}_supports_tools`).checked = def.supports_tools !== false;
+  document.getElementById(`${prefix}_supports_json`).checked = def.supports_response_format !== false;
+}
+
+function fillProviderFields(prefix, cfg){
+  const provider = cfg.provider || "OpenAI";
+  document.getElementById(`${prefix}_provider`).value = provider;
+  document.getElementById(`${prefix}_model`).value = cfg.model || "";
+  document.getElementById(`${prefix}_key`).value = cfg.api_key || "";
+  const def = providers[provider] || {};
+  document.getElementById(`${prefix}_base_url`).value = cfg.base_url || def.base_url || "";
+  document.getElementById(`${prefix}_headers`).value = cfg.headers ? JSON.stringify(cfg.headers, null, 2) : "";
+  document.getElementById(`${prefix}_supports_tools`).checked =
+    cfg.supports_tools !== undefined ? cfg.supports_tools : (def.supports_tools !== false);
+  document.getElementById(`${prefix}_supports_json`).checked =
+    cfg.supports_response_format !== undefined ? cfg.supports_response_format : (def.supports_response_format !== false);
+}
+
+async function loadConfig(){
+  try{
+    const res = await fetch("/api/config");
+    if(!res.ok) return;
+    const data = await res.json();
+    fillProviderFields("meta", data.meta || {});
+    fillProviderFields("main", data.main || {});
+    fillProviderFields("sub", data.sub || {});
+  }catch(err){
+    showError(err.message);
+  }
+}
+
+function buildProviderPayload(prefix){
+  const provider = document.getElementById(`${prefix}_provider`).value;
+  const model = document.getElementById(`${prefix}_model`).value;
+  const api_key = document.getElementById(`${prefix}_key`).value;
+  const base_url = document.getElementById(`${prefix}_base_url`).value || null;
+  const headersText = document.getElementById(`${prefix}_headers`).value.trim();
+  let headers = null;
+  if(headersText){
+    headers = JSON.parse(headersText);
+  }
+  const supports_tools = document.getElementById(`${prefix}_supports_tools`).checked;
+  const supports_response_format = document.getElementById(`${prefix}_supports_json`).checked;
+  const provider_type = provider === "Anthropic" ? "anthropic" : "openai_compatible";
+  return {provider, provider_type, model, api_key, base_url, headers, supports_tools, supports_response_format};
+}
+
+async function saveConfig(){
+  try{
+    const payload = {
+      meta: buildProviderPayload("meta"),
+      main: buildProviderPayload("main"),
+      sub: buildProviderPayload("sub")
+    };
+    const res=await fetch("/api/config",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)
+    });
+    if(!res.ok) throw new Error("Failed to save config");
+    showPage("chat");
+  }catch(err){
     showError(err.message);
   }
 }
@@ -379,6 +1088,13 @@ input.addEventListener("keydown",e=>{
     e.preventDefault();
     handleSend();
   }
+});
+
+window.addEventListener("load", async () => {
+  await loadProviders();
+  await loadConfig();
+  await refreshSessions();
+  await ensureCurrentSession();
 });
 </script>
 

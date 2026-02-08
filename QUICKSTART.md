@@ -40,6 +40,8 @@ python main.py
 4. Click **Save Configuration**
 5. Click **Chat** and start chatting!
 
+You can create, rename, and resume sessions from the Sessions panel.
+
 ## Getting API Keys
 
 ### Groq (Free Tier Available)
@@ -68,18 +70,33 @@ python main.py
 {
   "meta": {
     "provider": "Groq",
+    "provider_type": "openai_compatible",
     "model": "mixtral-8x7b-32768",
-    "api_key": "gsk_..."
+    "api_key": "gsk_...",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   },
   "main": {
     "provider": "Anthropic",
+    "provider_type": "anthropic",
     "model": "claude-sonnet-4-20250514",
-    "api_key": "sk-ant-..."
+    "api_key": "sk-ant-...",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   },
   "sub": {
     "provider": "Groq",
+    "provider_type": "openai_compatible",
     "model": "llama3-70b-8192",
-    "api_key": "gsk_..."
+    "api_key": "gsk_...",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
   }
 }
 ```
@@ -111,6 +128,7 @@ Have a few conversations, then say:
 - Sub Agents are for simple tasks - fast/cheap is fine
 - Memory files evolve over time - check `memory/user.md` after a few chats
 - Edit `prompts/meta_agent.txt` and `prompts/main_agent.txt` to customize behavior
+- Shell commands require approval in the UI
 
 ## Troubleshooting
 
@@ -122,6 +140,9 @@ Have a few conversations, then say:
 
 **Tool execution fails**
 → Check file paths and permissions
+
+**Tool approval required**
+→ Approve once, always allow for the session, or deny and ask for manual steps
 
 **Meta agent not analyzing well**
 → Try a smarter model (but it will be slower/costlier)
