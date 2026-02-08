@@ -90,6 +90,41 @@ class LLMProvider:
         "DeepSeek": "https://api.deepseek.com/v1/chat/completions",
         "Google": "https://generativelanguage.googleapis.com/v1beta/chat/completions",
     }
+    CAPABILITIES = {
+        "Groq": {
+            "tools": False,
+            "response_format": False
+        },
+        "OpenAI": {
+            "tools": True,
+            "response_format": True
+        },
+        "Mistral": {
+            "tools": True,
+            "response_format": True
+        },
+        "Anthropic": {
+            "tools": True,
+            "response_format": False
+        },
+        "Together": {
+            "tools": False,
+            "response_format": False
+        },
+        "OpenRouter": {
+            "tools": True,
+            "response_format": True
+        },
+        "DeepSeek": {
+            "tools": False,
+            "response_format": False
+        },
+        "Google": {
+            "tools": False,
+            "response_format": False
+        }
+    }
+
     
     @staticmethod
     async def call(provider_config: ProviderConfig, messages: List[Dict[str, str]], 
@@ -120,13 +155,19 @@ class LLMProvider:
             "model": config.model,
             "messages": messages,
         }
-        
-        if tools:
+
+        # Get provider capabilities
+        caps = LLMProvider.CAPABILITIES.get(config.provider, {})
+
+        # Add tools only if supported
+        if tools and caps.get("tools"):
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        
-        if response_format:
+
+        # Add response_format only if supported
+        if response_format and caps.get("response_format"):
             payload["response_format"] = response_format
+
         
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
