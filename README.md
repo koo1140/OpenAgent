@@ -1,5 +1,6 @@
 # OpenAgent
-<img width="1191" height="904" alt="image" src="https://github.com/user-attachments/assets/37ab8b45-aea0-4e19-b35e-e7521df08070" />
+<img width="1918" height="913" alt="image" src="https://github.com/user-attachments/assets/0298b148-3327-4bee-9ecd-981ba20caeb7" />
+
 
 A sophisticated multi-agent LLM orchestration system with meta-cognitive capabilities, memory management, and adaptive learning.
 
