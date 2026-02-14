@@ -13,7 +13,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 app = FastAPI()
@@ -112,7 +112,7 @@ DEFAULT_PROVIDERS: Dict[str, Dict[str, Any]] = {
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def truncate(text: str, limit: int = TOOL_OUTPUT_LIMIT) -> str:
@@ -1717,6 +1717,7 @@ async def chat_stream(request: ChatRequest):
     async def event_generator():
         yield sse_event("stage", {"name": "meta_start"})
         session_history, working_memory = build_session_context(session_id)
+        subagent_outputs: List[Dict[str, Any]] = []
         # Include current message in context for analysis
         session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
 
@@ -1798,7 +1799,6 @@ async def chat_stream(request: ChatRequest):
 
         shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
         tool_events: List[Dict[str, Any]] = []
-        subagent_outputs: List[Dict[str, Any]] = []
         tools_started = False
 
         for _ in range(MAX_TOOL_ROUNDS):
