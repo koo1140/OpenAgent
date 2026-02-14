@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "provider": "OpenAI",
+    "model": "gpt-4",
+    "api_key": "dummy-key"
+  },
+  "main": {
+    "provider": "OpenAI",
+    "model": "gpt-4",
+    "api_key": "dummy-key"
+  },
+  "sub": {
+    "provider": "OpenAI",
+    "model": "gpt-4",
+    "api_key": "dummy-key"
+  },
+  "parallel_meta_calls": true
+}

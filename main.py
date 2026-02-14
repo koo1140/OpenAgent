@@ -38,6 +38,9 @@ MEMORY_DIR = Path("memory")
 PROMPTS_DIR = Path("prompts")
 SKILLS_DIR = Path("skills")
 
+PERSISTENT_MEMORY_PATH = MEMORY_DIR / "persistent.json"
+SKILLS_INDEX_PATH = SKILLS_DIR / "skills.json"
+
 MAX_HISTORY_TURNS = 10
 MAX_META_TURNS = 50
 MAX_TOOL_ROUNDS = 3
@@ -156,6 +159,7 @@ class AgentConfig(BaseModel):
     meta: ProviderConfig
     main: ProviderConfig
     sub: ProviderConfig
+    parallel_meta_calls: bool = True
 
 
 class ChatMessage(BaseModel):
@@ -165,23 +169,27 @@ class ChatMessage(BaseModel):
 
 class MetaOutput(BaseModel):
     model_config = ConfigDict(extra="allow")
+    # Layer 1: Meta Agents
+    intent: Optional[Dict[str, Any]] = None
+    tone: Optional[Dict[str, Any]] = None
+    user: Optional[Dict[str, Any]] = None
+    subject: Optional[Dict[str, Any]] = None
+    needs: Optional[Dict[str, Any]] = None
+    patterns: Optional[Dict[str, Any]] = None
+
+    # Layer 2: Planner
+    plan: Optional[Dict[str, Any]] = None
+
+    # Layer 5: Gatekeeper (stored from previous turn or current)
+    gatekeeper: Optional[Dict[str, Any]] = None
+
+    # Legacy fields (for compatibility if needed, but we'll try to move away)
     user_intent: str = "unknown"
     chat_subject: str = "general"
     user_tone: str = "neutral"
     recommended_plan: str = "respond conversationally"
-    keepMemoryFilesLoaded: bool = False
-    memory_files_to_load: Optional[List[str]] = None
-    skills_to_load: Optional[List[str]] = None
     extra_instructions: Optional[str] = None
-    subagent_suggestions: List[Dict[str, Any]] = Field(default_factory=list)
-    subagents_needed: List[Dict[str, Any]] = Field(default_factory=list)
-    knowledge_needed: List[str] = Field(default_factory=list)
-    knowledge_gaps: List[str] = Field(default_factory=list)
-    learning_opportunities: List[str] = Field(default_factory=list)
-    aha_moments: List[str] = Field(default_factory=list)
     memory_actions: List[Dict[str, Any]] = Field(default_factory=list)
-    tone_changes_noticed: Optional[str] = None
-    mental_health_update: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -225,6 +233,11 @@ temp_sessions: Dict[str, Dict[str, Any]] = {}
 MEMORY_DIR.mkdir(exist_ok=True)
 SKILLS_DIR.mkdir(exist_ok=True)
 
+if not PERSISTENT_MEMORY_PATH.exists():
+    PERSISTENT_MEMORY_PATH.write_text(json.dumps({"memories": []}, indent=2))
+if not SKILLS_INDEX_PATH.exists():
+    SKILLS_INDEX_PATH.write_text(json.dumps({"skills": []}, indent=2))
+
 
 # =============================================================================
 # DATABASE
@@ -247,7 +260,8 @@ def init_db() -> None:
             title TEXT,
             created_at TEXT,
             updated_at TEXT,
-            persistent INTEGER
+            persistent INTEGER,
+            working_memory TEXT
         )
         """
     )
@@ -282,6 +296,13 @@ def init_db() -> None:
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tool_events_turn ON tool_events(turn_id)")
+
+    # Migration: Add working_memory to sessions if it doesn't exist
+    try:
+        cur.execute("ALTER TABLE sessions ADD COLUMN working_memory TEXT")
+    except sqlite3.OperationalError:
+        pass # Already exists
+
     conn.commit()
     conn.close()
 
@@ -436,10 +457,10 @@ class LLMProvider:
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        cfg = resolve_provider_config(provider_config)
-        if cfg.provider_type == "anthropic":
-            return await LLMProvider._call_anthropic(cfg, messages, tools)
-        return await LLMProvider._call_openai_compatible(cfg, messages, tools, response_format)
+        if provider_config.provider_type == "openai_compatible":
+            return await LLMProvider._call_openai_compatible(provider_config, messages, tools, response_format)
+        else:
+            return await LLMProvider._call_anthropic(provider_config, messages, tools)
 
     @staticmethod
     async def _call_openai_compatible(
@@ -619,6 +640,67 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_create",
+            "description": "Save a piece of information to persistent memory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The content to save"},
+                    "category": {"type": "string", "enum": ["episodic", "semantic", "procedural"], "description": "Memory category"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for the memory"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search for information in persistent memory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags to filter by"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_create",
+            "description": "Create a new skill and save it",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the skill"},
+                    "description": {"type": "string", "description": "Brief description of the skill"},
+                    "content": {"type": "string", "description": "The content/logic of the skill"},
+                },
+                "required": ["name", "description", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_load",
+            "description": "Load an existing skill's content",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the skill to load"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -695,6 +777,83 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
                     content=arguments.get("body"),
                 )
                 return f"Status: {response.status_code}\n{response.text}"
+
+        if name == "memory_create":
+            import time
+            content = PERSISTENT_MEMORY_PATH.read_text()
+            data = json.loads(content)
+            memory = {
+                "id": len(data["memories"]),
+                "content": arguments.get("content", ""),
+                "category": arguments.get("category", "semantic"),
+                "tags": arguments.get("tags", []),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            data["memories"].append(memory)
+            PERSISTENT_MEMORY_PATH.write_text(json.dumps(data, indent=2))
+            return f"Memory saved (id: {memory['id']})"
+
+        if name == "memory_search":
+            query = arguments.get("query", "").lower()
+            tags = arguments.get("tags", [])
+            content = PERSISTENT_MEMORY_PATH.read_text()
+            data = json.loads(content)
+            results = []
+            for m in data["memories"]:
+                score = 0
+                if query in m["content"].lower():
+                    score += 1
+                if tags:
+                    for t in tags:
+                        if t in m.get("tags", []):
+                            score += 1
+                if score > 0:
+                    results.append(m)
+
+            res_list = results[:10]
+            if not res_list:
+                return "No memories found."
+            return json.dumps(res_list, indent=2)
+
+        if name == "skill_create":
+            name_val = arguments.get("name", "")
+            description = arguments.get("description", "")
+            content_val = arguments.get("content", "")
+
+            idx_content = SKILLS_INDEX_PATH.read_text()
+            index = json.loads(idx_content)
+
+            file_name = f"{name_val}.md"
+            index["skills"].append({
+                "name": name_val,
+                "description": description,
+                "file": file_name
+            })
+            SKILLS_INDEX_PATH.write_text(json.dumps(index, indent=2))
+            (SKILLS_DIR / file_name).write_text(content_val)
+            return f"Skill '{name_val}' created and saved to {file_name}."
+
+        if name == "skill_load":
+            name_val = arguments.get("name", "")
+            # Try to find in index first
+            idx_content = SKILLS_INDEX_PATH.read_text()
+            index = json.loads(idx_content)
+            skill_info = next((s for s in index["skills"] if s["name"] == name_val), None)
+
+            file_path = None
+            if skill_info:
+                file_path = SKILLS_DIR / skill_info["file"]
+            else:
+                # Fallback to direct filename check
+                for ext in [".md", ".txt", ""]:
+                    p = SKILLS_DIR / (name_val + ext)
+                    if p.exists() and p.is_file():
+                        file_path = p
+                        break
+
+            if file_path and file_path.exists():
+                return file_path.read_text()
+            return f"Skill '{name_val}' not found."
 
         return f"Unknown tool: {name}"
     except Exception as exc:
@@ -975,18 +1134,30 @@ def get_recent_tool_logs(session_id: str, limit: int = 20) -> List[Dict[str, Any
     ]
 
 
-def build_session_context(session_id: str) -> str:
+def build_session_context(session_id: str) -> Tuple[str, str]:
     turns = get_recent_turns(session_id, MAX_META_TURNS)
     conversation: List[Dict[str, Any]] = []
     for turn in turns:
         conversation.append({"role": "user", "content": turn["user_message"]})
         conversation.append({"role": "assistant", "content": turn["assistant_reply"]})
     tool_logs = get_recent_tool_logs(session_id, 20)
+
+    working_memory = ""
+    if session_id in temp_sessions:
+        working_memory = temp_sessions[session_id].get("working_memory", "")
+    else:
+        conn = db_connect()
+        row = conn.execute("SELECT working_memory FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        conn.close()
+        if row:
+            working_memory = row["working_memory"] or ""
+
     session_context = {
         "conversation": conversation,
         "tool_logs": tool_logs,
+        "working_memory": working_memory
     }
-    return json.dumps(session_context, indent=2)
+    return json.dumps(session_context, indent=2), working_memory
 
 
 def store_turn(
@@ -1075,56 +1246,143 @@ def store_turn(
 # AGENT ORCHESTRATION
 # =============================================================================
 
-async def run_meta_agent(session_context: str) -> MetaOutput:
-    logger.debug(f"Starting meta agent with session context: {session_context[:100]}...")
+async def run_meta_layer(session_context: str, skills_index: str, memory_context: str, on_agent_complete: Optional[Any] = None) -> Dict[str, Any]:
+    meta_agents = {
+        "intent": "prompts/meta_intent.txt",
+        "tone": "prompts/meta_tone.txt",
+        "user": "prompts/meta_user.txt",
+        "subject": "prompts/meta_subject.txt",
+        "needs": "prompts/meta_needs.txt",
+        "patterns": "prompts/meta_patterns.txt",
+    }
     
-    try:
-        meta_prompt = load_meta_agent_prompt()
-        logger.debug(f"Loaded meta prompt: {meta_prompt[:50]}...")
+    results = {}
+
+    if config.parallel_meta_calls:
+        async def call_agent(name, prompt_path):
+            prompt = Path(prompt_path).read_text()
+            if name == "needs":
+                prompt = prompt.replace("{skills_index}", skills_index)
+
+            system_prompt = f"{prompt}\n\n{memory_context}"
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": session_context}
+            ]
+            try:
+                resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+                content = resp["choices"][0]["message"]["content"]
+                res = json.loads(content)
+                if on_agent_complete:
+                    await on_agent_complete(name, res)
+                return name, res
+            except Exception as e:
+                logger.error(f"Error in meta agent {name}: {e}")
+                err_res = {"error": str(e)}
+                if on_agent_complete:
+                    await on_agent_complete(name, err_res)
+                return name, err_res
+
+        tasks = [call_agent(name, path) for name, path in meta_agents.items()]
+        completed = await asyncio.gather(*tasks)
+        for name, result in completed:
+            results[name] = result
+    else:
+        # Combined call
+        combined_prompt = "You are a meta-analysis system. Perform the following 6 analyses on the conversation and output a single JSON object with keys: intent, tone, user, subject, needs, patterns.\n\n"
+        for name, path in meta_agents.items():
+            prompt = Path(path).read_text()
+            if name == "needs":
+                prompt = prompt.replace("{skills_index}", skills_index)
+            combined_prompt += f"--- {name.upper()} ---\n{prompt}\n\n"
         
-        memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
-        logger.debug(f"Loaded memory context: {memory_context[:50]}...")
-        
-        skills_list = list_available_skills()
-        skills_text = ", ".join(skills_list) if skills_list else "none"
-        logger.debug(f"Available skills: {skills_text}")
-        
-        system_content = f"{meta_prompt}\n\nAvailable skills: {skills_text}\n\n{memory_context}".strip()
+        system_prompt = f"{combined_prompt}\n\n{memory_context}"
         messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": f"Session Context:\n{session_context}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": session_context}
         ]
-        
-        logger.debug("Calling LLM provider for meta agent...")
-        response = await LLMProvider.call(
-            config.meta,
-            messages,
-            response_format=None,  # Remove JSON enforcement - accept any format
-        )
-        
-        content = response["choices"][0]["message"]["content"]
-        logger.debug(f"Received meta agent response: {content}")
-        
-        # Let raw message flow through - no parsing, no validation, no rejection
-        logger.info("Meta agent response accepted as-is (no validation)")
-        
-        # Create MetaOutput directly from raw content without parsing
-        return MetaOutput(
-            user_intent="unknown",
-            chat_subject="general",
-            user_tone="neutral",
-            recommended_plan="respond conversationally",
-            extra_instructions=content  # Pass through the raw response
-        )
+        try:
+            resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+            content = resp["choices"][0]["message"]["content"]
+            results = json.loads(content)
+            if on_agent_complete:
+                for name, res in results.items():
+                    await on_agent_complete(name, res)
+        except Exception as e:
+            logger.error(f"Error in combined meta agent call: {e}")
+            results = {"error": str(e)}
+            if on_agent_complete:
+                await on_agent_complete("error", results)
+
+    return results
+
+async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, skills_index: str) -> Dict[str, Any]:
+    prompt = Path("prompts/planner.txt").read_text()
+    context = f"META ANALYSIS:\n{json.dumps(meta_output, indent=2)}\n\nWORKING MEMORY:\n{working_memory}\n\nAVAILABLE SKILLS:\n{skills_index}"
+
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": context}
+    ]
+
+    try:
+        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content)
     except Exception as e:
-        logger.error(f"Unexpected error in meta agent: {e}", exc_info=True)
-        return MetaOutput(
-            user_intent="unknown",
-            chat_subject="general",
-            user_tone="neutral",
-            recommended_plan="respond conversationally",
-            extra_instructions=f"Meta agent error: {str(e)[:100]}"
-        )
+        logger.error(f"Error in planner layer: {e}")
+        return {"error": str(e), "just_chat": True, "plan": "respond conversationally"}
+
+async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: str, identity_md: str) -> Dict[str, Any]:
+    prompt = Path("prompts/gatekeeper.txt").read_text()
+    context = f"CONVERSATION:\n{conversation}\n\nAGENT RESPONSE:\n{agent_response}\n\nCURRENT USER.MD:\n{user_md}\n\nCURRENT IDENTITY.MD:\n{identity_md}"
+
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": context}
+    ]
+
+    try:
+        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"Error in gatekeeper layer: {e}")
+        return {"error": str(e)}
+
+async def apply_gatekeeper(session_id: str, persistent: bool, result: Dict[str, Any]) -> None:
+    if not result:
+        return
+
+    if result.get("save_memory") and result.get("memory"):
+        m = result["memory"]
+        # Use our memory_create tool logic (to be implemented/updated)
+        await execute_tool("memory_create", {
+            "content": m.get("content", ""),
+            "category": m.get("category", ""),
+            "tags": m.get("tags", [])
+        })
+        logger.info(f"  [GATE] Memory saved for session {session_id}")
+
+    if result.get("update_user") and result.get("user_update"):
+        path = MEMORY_DIR / "user.md"
+        current = path.read_text() if path.exists() else ""
+        path.write_text(current + "\n" + result["user_update"])
+        logger.info(f"  [GATE] User updated")
+
+    if result.get("update_identity") and result.get("identity_update"):
+        path = MEMORY_DIR / "identity.md"
+        current = path.read_text() if path.exists() else ""
+        path.write_text(current + "\n" + result["identity_update"])
+        logger.info(f"  [GATE] Identity updated")
+
+    if "working_memory_summary" in result:
+        working_mem = result["working_memory_summary"]
+        conn = db_connect()
+        conn.execute("UPDATE sessions SET working_memory = ? WHERE id = ?", (working_mem, session_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"  [GATE] Working memory updated for session {session_id}")
 
 
 def build_main_messages(
@@ -1132,12 +1390,17 @@ def build_main_messages(
     meta_output: MetaOutput,
     history_turns: List[Dict[str, Any]],
     subagent_outputs: List[Dict[str, Any]],
+    loaded_context: str = ""
 ) -> List[Dict[str, Any]]:
     main_prompt = load_main_agent_prompt()
 
     available_memory = list_available_memory_files()
     available_skills = list_available_skills()
-    extra_instructions = meta_output.extra_instructions or ""
+
+    # Planner's notes are now our extra instructions
+    extra_instructions = ""
+    if meta_output.plan:
+        extra_instructions = meta_output.plan.get("notes_for_main", "")
 
     memory_text = ", ".join(available_memory) if available_memory else "none"
     skills_text = ", ".join(available_skills) if available_skills else "none"
@@ -1148,11 +1411,14 @@ def build_main_messages(
         f"Available skills: {skills_text}. Use read_file to load if needed.",
     ]
     if extra_instructions:
-        system_parts.append(f"Extra instructions:\n{extra_instructions}")
+        system_parts.append(f"Instruction from Planner:\n{extra_instructions}")
+
+    if loaded_context:
+        system_parts.append(f"LOADED CONTEXT:\n{loaded_context}")
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": "\n\n".join(system_parts)},
-        {"role": "system", "content": f"Meta analysis JSON:\n{meta_output.model_dump_json(indent=2)}"},
+        {"role": "system", "content": f"Meta analysis and Plan JSON:\n{meta_output.model_dump_json(indent=2)}"},
     ]
 
     if subagent_outputs:
@@ -1450,15 +1716,85 @@ async def chat_stream(request: ChatRequest):
 
     async def event_generator():
         yield sse_event("stage", {"name": "meta_start"})
-        session_context = build_session_context(session_id)
-        meta_output = await run_meta_agent(session_context)
+        session_history, working_memory = build_session_context(session_id)
+        # Include current message in context for analysis
+        session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
+
+        skills_list = list_available_skills()
+        skills_index = ", ".join(skills_list) if skills_list else "none"
+        memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
+
+        # Layer 1: Root Meta
+        queue = asyncio.Queue()
+        async def on_meta_complete(name, result):
+            await queue.put((name, result))
+
+        meta_task = asyncio.create_task(run_meta_layer(session_context, skills_index, memory_context, on_meta_complete))
+
+        meta_results = {}
+        agents_count = 6 if config.parallel_meta_calls else 1
+        # If combined call, it might return all 6 in one go, so agents_count=1 is better for the loop
+        # But wait, my run_meta_layer calls on_meta_complete for each item in the results dict.
+        # So it will still be 6 calls to the queue.
+        # Let's adjust agents_count to be the expected number of items in the queue.
+        expected_items = 6 if config.parallel_meta_calls else 6 # In both cases we expect 6 results
+        # actually if error it might be less.
+        # I'll use a safer approach.
+
+        while len(meta_results) < 6:
+            try:
+                name, result = await asyncio.wait_for(queue.get(), timeout=30.0)
+                if name == "error":
+                    meta_results["error"] = result
+                    break
+                meta_results[name] = result
+                yield sse_event("meta_partial", {name: result})
+            except asyncio.TimeoutError:
+                break
+
+        await meta_task
+
+        # Layer 2: Planner
+        yield sse_event("stage", {"name": "planning_start"})
+        plan_result = await run_planner_layer(meta_results, working_memory, skills_index)
+        yield sse_event("meta_partial", {"plan": plan_result})
+
+        meta_output = MetaOutput(
+            intent=meta_results.get("intent"),
+            tone=meta_results.get("tone"),
+            user=meta_results.get("user"),
+            subject=meta_results.get("subject"),
+            needs=meta_results.get("needs"),
+            patterns=meta_results.get("patterns"),
+            plan=plan_result
+        )
         yield sse_event("meta", meta_output.model_dump())
 
-        if meta_output.memory_actions:
-            apply_memory_actions(meta_output.memory_actions)
+        # Load requested context from planner
+        loaded_context = ""
+        if plan_result.get("load_memories"):
+            for query in plan_result["load_memories"]:
+                results = await execute_tool("memory_search", {"query": query})
+                loaded_context += f"Memory search '{query}': {results}\n"
+
+        if plan_result.get("load_skills"):
+            for skill in plan_result["load_skills"]:
+                content = await execute_tool("skill_load", {"name": skill})
+                loaded_context += f"Skill '{skill}': {content}\n"
+
+        # Sub agents triggered by planner
+        if plan_result.get("use_sub_agents"):
+            yield sse_event("stage", {"name": "subagents_start"})
+            sub_tasks = plan_result.get("sub_agent_tasks", [])
+            sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
+            outputs = await run_subagents(sub_specs)
+            subagent_outputs.extend(outputs)
+            for output in outputs:
+                yield sse_event("subagent", output)
+                loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
 
         history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
-        messages = build_main_messages(request.message, meta_output, history_turns, [])
+        messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
 
         shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
         tool_events: List[Dict[str, Any]] = []
@@ -1597,6 +1933,14 @@ async def chat_stream(request: ChatRequest):
                 tool_events=tool_events,
                 subagent_outputs=subagent_outputs,
             )
+            # Layer 5: Gatekeeper
+            yield sse_event("stage", {"name": "gatekeeper_start"})
+            user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+            identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+            gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
+            await apply_gatekeeper(session_id, persistent, gate_result)
+            meta_output.gatekeeper = gate_result
+
             yield sse_event("assistant", {
                 "content": reply,
                 "meta": meta_output.model_dump(),
@@ -1663,14 +2007,50 @@ async def chat(request: ChatRequest) -> ChatResponse:
     ensure_session_policy(session_id)
     persistent = session_id not in temp_sessions
 
-    session_context = build_session_context(session_id)
-    meta_output = await run_meta_agent(session_context)
+    session_history, working_memory = build_session_context(session_id)
+    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
 
-    if meta_output.memory_actions:
-        apply_memory_actions(meta_output.memory_actions)
+    skills_list = list_available_skills()
+    skills_index = ", ".join(skills_list) if skills_list else "none"
+    memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
+
+    meta_results = await run_meta_layer(session_context, skills_index, memory_context)
+    plan_result = await run_planner_layer(meta_results, working_memory, skills_index)
+
+    meta_output = MetaOutput(
+        intent=meta_results.get("intent"),
+        tone=meta_results.get("tone"),
+        user=meta_results.get("user"),
+        subject=meta_results.get("subject"),
+        needs=meta_results.get("needs"),
+        patterns=meta_results.get("patterns"),
+        plan=plan_result
+    )
+
+    # Load requested context from planner
+    loaded_context = ""
+    if plan_result.get("load_memories"):
+        for query in plan_result["load_memories"]:
+            results = await execute_tool("memory_search", {"query": query})
+            loaded_context += f"Memory search '{query}': {results}\n"
+
+    if plan_result.get("load_skills"):
+        for skill in plan_result["load_skills"]:
+            content = await execute_tool("skill_load", {"name": skill})
+            loaded_context += f"Skill '{skill}': {content}\n"
+
+    # Sub agents triggered by planner
+    subagent_outputs = []
+    if plan_result.get("use_sub_agents"):
+        sub_tasks = plan_result.get("sub_agent_tasks", [])
+        sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
+        outputs = await run_subagents(sub_specs)
+        subagent_outputs.extend(outputs)
+        for output in outputs:
+            loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
 
     history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
-    messages = build_main_messages(request.message, meta_output, history_turns, [])
+    messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
 
     shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
     loop_result = await run_tool_loop(
@@ -1733,6 +2113,13 @@ async def chat(request: ChatRequest) -> ChatResponse:
         tool_events=tool_events,
         subagent_outputs=subagent_outputs,
     )
+
+    # Layer 5: Gatekeeper
+    user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+    identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+    gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
+    await apply_gatekeeper(session_id, persistent, gate_result)
+    meta_output.gatekeeper = gate_result
 
     return ChatResponse(
         reply=reply,
@@ -1870,6 +2257,17 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
         tool_events=tool_events,
         subagent_outputs=subagent_outputs,
     )
+
+    # Layer 5: Gatekeeper
+    session_history, _ = build_session_context(request.session_id)
+    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {original_user_message}"
+    user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+    identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+    gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
+    await apply_gatekeeper(request.session_id, persistent, gate_result)
+
+    if isinstance(meta_json, dict):
+        meta_json["gatekeeper"] = gate_result
 
     return ChatResponse(
         reply=reply,
