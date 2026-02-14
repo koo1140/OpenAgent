@@ -616,22 +616,75 @@ button.danger {
   gap: 12px;
 }
 
-.progress::before {
-  content: '';
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--accent-purple);
-  border-top-color: transparent;
-  border-radius: 50%;
-  animation: spin 1s linear infinite;
+.progress-container {
+  margin: 0 32px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
+.progress-bar-wrapper {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid rgba(244, 208, 63, 0.1);
 }
 
-.progress.hidden{
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-gold), var(--accent-amber));
+  width: 0%;
+  transition: width 0.5s ease;
+  box-shadow: 0 0 10px var(--glow);
+}
+
+.progress-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.progress.hidden, .progress-container.hidden, .retry-container.hidden{
   display: none;
+}
+
+.retry-container {
+    background: rgba(239, 83, 80, 0.1);
+    border: 1px solid rgba(239, 83, 80, 0.3);
+    border-radius: var(--radius-md);
+    padding: 12px 16px;
+    margin: 0 32px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.retry-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--danger);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.retry-bar-wrapper {
+    width: 100%;
+    height: 4px;
+    background: rgba(239, 83, 80, 0.1);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.retry-bar-fill {
+    height: 100%;
+    background: var(--danger);
+    width: 100%;
 }
 
 .settings{
@@ -930,7 +983,25 @@ input[type="checkbox"] {
   </header>
 
   <div class="error" id="errorBanner" style="display:none"></div>
-  <div class="progress hidden" id="progressBanner"></div>
+
+  <div class="progress-container hidden" id="progressContainer">
+    <div class="progress-status">
+      <span id="progressText">Initializing...</span>
+      <span id="progressPercent">0%</span>
+    </div>
+    <div class="progress-bar-wrapper">
+      <div class="progress-bar-fill" id="progressBarFill"></div>
+    </div>
+  </div>
+
+  <div class="retry-container hidden" id="retryContainer">
+    <div class="retry-header">
+      <span>Rate Limit hit. Retrying in <span id="retryTimer">30</span>s...</span>
+    </div>
+    <div class="retry-bar-wrapper">
+      <div class="retry-bar-fill" id="retryBarFill"></div>
+    </div>
+  </div>
 
   <div id="mainLayout">
     <div id="sessionsPanel">
@@ -959,6 +1030,17 @@ input[type="checkbox"] {
         <textarea id="input" placeholder="Type your message..." rows="1"></textarea>
         <button onclick="handleSend()">Send</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="decisionModal">
+  <div class="modal-content">
+    <div class="modal-header">Rate Limit Persistent</div>
+    <p style="color: var(--text-secondary); margin-bottom: 20px;">The rate limit persists after retrying. Would you like to keep trying or stop?</p>
+    <div class="modal-actions">
+      <button onclick="handleDecision('continue')">Continue Trying</button>
+      <button class="danger" onclick="handleDecision('stop')">Stop</button>
     </div>
   </div>
 </div>
@@ -1048,9 +1130,18 @@ const chat = document.getElementById("chat");
 const input = document.getElementById("input");
 const sessionsList = document.getElementById("sessionsList");
 const errorBanner = document.getElementById("errorBanner");
-const progressBanner = document.getElementById("progressBanner");
+const progressContainer = document.getElementById("progressContainer");
+const progressText = document.getElementById("progressText");
+const progressBarFill = document.getElementById("progressBarFill");
+const progressPercent = document.getElementById("progressPercent");
+
+const retryContainer = document.getElementById("retryContainer");
+const retryTimer = document.getElementById("retryTimer");
+const retryBarFill = document.getElementById("retryBarFill");
+
 const toolModal = document.getElementById("toolModal");
 const pendingToolsList = document.getElementById("pendingToolsList");
+const decisionModal = document.getElementById("decisionModal");
 
 let currentSessionId = null;
 let sessionsCache = [];
@@ -1084,13 +1175,54 @@ function showError(msg){
   }, 5000);
 }
 
-function showProgress(msg){
+function showProgress(msg, percent){
   if(!msg){
-    progressBanner.classList.add("hidden");
+    progressContainer.classList.add("hidden");
     return;
   }
-  progressBanner.textContent = msg;
-  progressBanner.classList.remove("hidden");
+  progressContainer.classList.remove("hidden");
+  progressText.textContent = msg;
+  if (percent !== undefined) {
+    progressBarFill.style.width = percent + "%";
+    progressPercent.textContent = percent + "%";
+  }
+}
+
+let retryInterval = null;
+function startRateLimitCountdown(seconds){
+    retryContainer.classList.remove("hidden");
+    let remaining = seconds;
+    retryTimer.textContent = remaining;
+    retryBarFill.style.width = "100%";
+
+    if(retryInterval) clearInterval(retryInterval);
+
+    retryInterval = setInterval(() => {
+        remaining--;
+        retryTimer.textContent = remaining;
+        retryBarFill.style.width = (remaining / seconds * 100) + "%";
+        if(remaining <= 0){
+            clearInterval(retryInterval);
+            retryContainer.classList.add("hidden");
+        }
+    }, 1000);
+}
+
+function showRateLimitDecisionModal(){
+    decisionModal.classList.remove("hidden");
+}
+
+async function handleDecision(decision){
+    decisionModal.classList.add("hidden");
+    try {
+        await fetch("/api/chat/decision", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({session_id: currentSessionId, decision})
+        });
+    } catch(err) {
+        showError("Failed to send decision: " + err.message);
+    }
 }
 
 function addMessage(text, role){
@@ -1129,12 +1261,9 @@ function startLiveMessage(){
 
 function updateLiveMetaDetails() {
   if(!liveMessageDiv) {
-    const progressBanner = document.getElementById("progressBanner");
-    if(progressBanner) {
-        const keys = Object.keys(liveMeta).filter(k => k !== 'plan' && k !== 'gatekeeper');
-        if(keys.length > 0) {
-            progressBanner.textContent = "Meta Agents: " + keys.join(", ") + "...";
-        }
+    const keys = Object.keys(liveMeta).filter(k => k !== 'plan' && k !== 'gatekeeper');
+    if(keys.length > 0) {
+        showProgress("Meta Agents: " + keys.join(", ") + "...", 15);
     }
   } else {
     updateLiveDetails();
@@ -1449,13 +1578,22 @@ function handleSSEEvent(eventType, payload){
   if(eventType === "stage"){
     const name = payload.name || "";
     const map = {
-      "meta_start": "Meta Agents Thinking...",
-      "planning_start": "System Planner...",
-      "gatekeeper_start": "Gatekeeper...",
-      "subagents_start": "Subagents...",
-      "tools_start": "Tools..."
+      "meta_start": ["Meta Agents Thinking...", 10],
+      "planning_start": ["System Planner...", 30],
+      "gatekeeper_start": ["Gatekeeper...", 90],
+      "subagents_start": ["Subagents...", 50],
+      "tools_start": ["Tools...", 70]
     };
-    showProgress(map[name] || name);
+    const [msg, percent] = map[name] || [name, 0];
+    showProgress(msg, percent);
+    return;
+  }
+  if(eventType === "rate_limit_retry"){
+    startRateLimitCountdown(payload.seconds || 30);
+    return;
+  }
+  if(eventType === "rate_limit_error"){
+    showRateLimitDecisionModal();
     return;
   }
   if(eventType === "meta_partial"){

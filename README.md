@@ -6,11 +6,13 @@ A sophisticated multi-agent LLM orchestration system with meta-cognitive capabil
 
 ## Overview
 
-This system implements a three-layer agentic architecture:
+This system implements a sophisticated five-layer agentic architecture:
 
-1. **Meta Agent** - The observational consciousness that analyzes interactions, notices patterns, and guides the main agent
-2. **Main Agent** - The execution layer that interacts with users, uses tools, and gets things done
-3. **Sub Agents** - Specialized workers for complex parallel tasks
+1. **Layer 1: Meta-Analysis** - Observational consciousness analyzing intent, tone, and patterns across 6 dimensions.
+2. **Layer 2: System Planner** - Strategic layer that processes meta-analysis to decide on memory loading, tool strategies, and sub-agent deployment.
+3. **Layer 3: Main Agent** - The primary execution layer that interacts with the user and coordinates overall task completion.
+4. **Layer 4: Sub-Agents** - Specialized, focused workers spawned for parallel execution of complex sub-tasks.
+5. **Layer 5: Gatekeeper** - Final validation layer that summarizes the turn, updates working memory, and evolves persistent memory files.
 
 ## Key Features
 
@@ -60,6 +62,12 @@ Built-in tools for real work:
 - Approve once, always allow for session, or deny
 - Tool output is truncated in UI with on-demand full view
 
+### ⏳ Resilient Execution
+- Automatic 0.5s delay between API calls to prevent rate limits.
+- Built-in 429 (Rate Limit) handling with 30s automatic retry.
+- Interactive user decision (Continue/Stop) if rate limits persist.
+- Real-time progress visualization for every architectural stage.
+
 ### 🎯 Sub-Agent Orchestration
 Complex tasks can be split across specialized sub-agents with:
 - Limited context (just what they need)
@@ -70,37 +78,29 @@ Complex tasks can be split across specialized sub-agents with:
 ## Architecture
 
 ```
-User Input
-    ↓
-┌─────────────────────────────────────┐
-│         Meta Agent                  │
-│  - Analyzes full session context   │
-│  - Understands intent & emotion     │
-│  - Identifies opportunities         │
-│  - Decides memory loading           │
-│  - Plans approach                   │
-│  - Outputs structured JSON          │
-└─────────────────────────────────────┘
-    ↓ (JSON guidance)
-┌─────────────────────────────────────┐
-│         Main Agent                  │
-│  - Receives meta analysis           │
-│  - Loads memory files (if needed)   │
-│  - Uses tools to execute tasks      │
-│  - Spawns sub-agents if needed      │
-│  - Responds to user                 │
-│  - Updates memory files             │
-└─────────────────────────────────────┘
-    ↓ (if complex task)
-┌─────────────────────────────────────┐
-│         Sub Agents                  │
-│  - Specialized workers              │
-│  - Limited context                  │
-│  - Specific tools                   │
-│  - Return results to main           │
-└─────────────────────────────────────┘
-    ↓
-User Response
+         User Input
+             ↓
+┌───────────────────────────┐
+│  Layer 1: Meta-Analysis   │ (Intent, Tone, User, Subject, Needs, Patterns)
+└─────────────┬─────────────┘
+              ↓ (Structured Analysis)
+┌─────────────┴─────────────┐
+│  Layer 2: System Planner  │ (Strategy, Memory Actions, Sub-agent Tasks)
+└─────────────┬─────────────┘
+              ↓ (Strategic Plan)
+┌─────────────┴─────────────┐
+│    Layer 3: Main Agent    │ (Tool Use, Context Integration, User Response)
+└─────────────┬─────────────┘
+              ↓ (If Complex)
+┌─────────────┴─────────────┐
+│   Layer 4: Sub-Agents     │ (Parallel Focused Tasks)
+└─────────────┬─────────────┘
+              ↓ (Execution Results)
+┌─────────────┴─────────────┐
+│   Layer 5: Gatekeeper     │ (Turn Summary, Memory Evolution, Validation)
+└─────────────┬─────────────┘
+              ↓
+        User Response
 ```
 ---
 [![Star History Chart](https://api.star-history.com/svg?repos=koo1140/OpenAgent&type=date&legend=top-left)](https://www.star-history.com/#koo1140/OpenAgent&type=date&legend=top-left)
