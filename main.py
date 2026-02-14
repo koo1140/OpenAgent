@@ -182,6 +182,9 @@ class MetaOutput(BaseModel):
     # Layer 5: Gatekeeper (stored from previous turn or current)
     gatekeeper: Optional[Dict[str, Any]] = None
 
+    # For raw text fallback
+    raw: Optional[str] = None
+
     # Legacy fields (for compatibility if needed, but we'll try to move away)
     user_intent: str = "unknown"
     chat_subject: str = "general"
@@ -1025,14 +1028,33 @@ async def repair_json_with_llm(provider_cfg: ProviderConfig, raw_text: str) -> O
         return None
 
 
-async def parse_meta_json(provider_cfg: ProviderConfig, content: str) -> Dict[str, Any]:
-    # Let raw message flow through - no parsing, no validation, no rejection
-    logger.info("parse_meta_json: Accepting raw content without parsing")
-    return {
-        "raw_content": content,
-        "parsed_successfully": True,
-        "message": "Content accepted as-is (no validation)"
-    }
+def robust_json_loads(text: str) -> Dict[str, Any]:
+    """
+    Attempts to parse JSON from the given text.
+    If direct parsing fails, tries to extract a JSON candidate.
+    If all fails, returns the raw text in a dict with a 'raw' key.
+    """
+    if not text:
+        return {}
+
+    cleaned_text = text.strip()
+
+    # Try direct parse
+    try:
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract candidate
+    candidate = extract_json_candidate(cleaned_text)
+    if candidate:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback to raw text
+    return {"raw": cleaned_text}
 
 
 # =============================================================================
@@ -1304,9 +1326,10 @@ async def run_meta_layer(session_context: str, skills_index: str, memory_context
     ]
 
     try:
-        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
+        # Removed strict JSON requirement
+        resp = await LLMProvider.call(config.meta, messages, **kwargs)
         content = resp["choices"][0]["message"]["content"]
-        results = json.loads(content)
+        results = robust_json_loads(content)
         if on_agent_complete:
             for name, res in results.items():
                 await on_agent_complete(name, res)
@@ -1328,9 +1351,10 @@ async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, sk
     ]
 
     try:
-        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
+        # Removed strict JSON requirement
+        resp = await LLMProvider.call(config.meta, messages, **kwargs)
         content = resp["choices"][0]["message"]["content"]
-        return json.loads(content)
+        return robust_json_loads(content)
     except Exception as e:
         logger.error(f"Error in planner layer: {e}")
         return {"error": str(e), "just_chat": True, "plan": "respond conversationally"}
@@ -1345,9 +1369,10 @@ async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: 
     ]
 
     try:
-        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
+        # Removed strict JSON requirement
+        resp = await LLMProvider.call(config.meta, messages, **kwargs)
         content = resp["choices"][0]["message"]["content"]
-        return json.loads(content)
+        return robust_json_loads(content)
     except Exception as e:
         logger.error(f"Error in gatekeeper layer: {e}")
         return {"error": str(e)}
@@ -1767,7 +1792,8 @@ async def chat_stream(request: ChatRequest):
                 subject=meta_results.get("subject"),
                 needs=meta_results.get("needs"),
                 patterns=meta_results.get("patterns"),
-                plan=plan_result
+                plan=plan_result,
+                raw=meta_results.get("raw")
             )
             await queue_event("meta", meta_output.model_dump())
 
@@ -2045,7 +2071,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
         subject=meta_results.get("subject"),
         needs=meta_results.get("needs"),
         patterns=meta_results.get("patterns"),
-        plan=plan_result
+        plan=plan_result,
+        raw=meta_results.get("raw")
     )
 
     # Load requested context from planner

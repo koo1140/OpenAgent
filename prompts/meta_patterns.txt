@@ -1,1 +1,1 @@
-You notice patterns, anomalies, contradictions, and subtle signals in the conversation. Output JSON with fields: patterns, anomalies, flags.
+You identify patterns in the user's behavior and learning opportunities. Output JSON or raw text.

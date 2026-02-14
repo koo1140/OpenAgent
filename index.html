@@ -1064,7 +1064,6 @@ input[type="checkbox"] {
       <textarea class="small" id="meta_headers" placeholder='{"x-custom":"value"}'></textarea>
       <div class="row">
         <label><input type="checkbox" id="meta_supports_tools"> Supports Tools</label>
-        <label><input type="checkbox" id="meta_supports_json"> Supports JSON Mode</label>
       </div>
     </div>
 
@@ -1082,7 +1081,6 @@ input[type="checkbox"] {
       <textarea class="small" id="main_headers" placeholder='{"x-custom":"value"}'></textarea>
       <div class="row">
         <label><input type="checkbox" id="main_supports_tools"> Supports Tools</label>
-        <label><input type="checkbox" id="main_supports_json"> Supports JSON Mode</label>
       </div>
     </div>
 
@@ -1100,7 +1098,6 @@ input[type="checkbox"] {
       <textarea class="small" id="sub_headers" placeholder='{"x-custom":"value"}'></textarea>
       <div class="row">
         <label><input type="checkbox" id="sub_supports_tools"> Supports Tools</label>
-        <label><input type="checkbox" id="sub_supports_json"> Supports JSON Mode</label>
       </div>
     </div>
 
@@ -1321,7 +1318,14 @@ function buildDetailsHTML(meta, toolEvents, subagentOutputs){
   }
   let html = '<details class="details"><summary>Details</summary>';
   if(meta){
-    html += `<pre>${JSON.stringify(meta, null, 2)}</pre>`;
+    if (typeof meta === 'string') {
+      html += `<pre>${meta}</pre>`;
+    } else if (meta.raw && Object.keys(meta).length === 1) {
+      // If it only contains raw text from our new fallback
+      html += `<pre>${meta.raw}</pre>`;
+    } else {
+      html += `<pre>${JSON.stringify(meta, null, 2)}</pre>`;
+    }
   }
   if(toolEvents && toolEvents.length > 0){
     toolEvents.forEach(ev => {
@@ -1737,7 +1741,6 @@ function applyProviderDefaults(prefix, providerName){
     baseUrlInput.value = def.base_url || "";
   }
   document.getElementById(`${prefix}_supports_tools`).checked = def.supports_tools !== false;
-  document.getElementById(`${prefix}_supports_json`).checked = def.supports_response_format !== false;
 }
 
 function fillProviderFields(prefix, cfg){
@@ -1750,8 +1753,6 @@ function fillProviderFields(prefix, cfg){
   document.getElementById(`${prefix}_headers`).value = cfg.headers ? JSON.stringify(cfg.headers, null, 2) : "";
   document.getElementById(`${prefix}_supports_tools`).checked =
     cfg.supports_tools !== undefined ? cfg.supports_tools : (def.supports_tools !== false);
-  document.getElementById(`${prefix}_supports_json`).checked =
-    cfg.supports_response_format !== undefined ? cfg.supports_response_format : (def.supports_response_format !== false);
 }
 
 async function loadConfig(){
@@ -1778,9 +1779,9 @@ function buildProviderPayload(prefix){
     headers = JSON.parse(headersText);
   }
   const supports_tools = document.getElementById(`${prefix}_supports_tools`).checked;
-  const supports_response_format = document.getElementById(`${prefix}_supports_json`).checked;
   const provider_type = provider === "Anthropic" ? "anthropic" : "openai_compatible";
-  return {provider, provider_type, model, api_key, base_url, headers, supports_tools, supports_response_format};
+  // Defaulting supports_response_format to false as we removed it from UI
+  return {provider, provider_type, model, api_key, base_url, headers, supports_tools, supports_response_format: false};
 }
 
 async function saveConfig(){

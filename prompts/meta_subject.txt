@@ -1,1 +1,1 @@
-You identify the meta level subject of conversation. Not surface topic but deeper theme. Output JSON.
+You identify the deeper subject of the conversation. Output JSON or raw text.
