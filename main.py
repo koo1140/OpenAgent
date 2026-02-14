@@ -1398,8 +1398,32 @@ async def run_meta_layer(
         results = robust_json_loads(content)
         if not isinstance(results, dict):
             results = {"raw": content}
+        meta_dict_keys = ("intent", "tone", "user", "subject", "needs", "patterns")
+        for key in meta_dict_keys:
+            value = results.get(key)
+            if value is None or isinstance(value, dict):
+                continue
+            # MetaOutput expects dict sections; wrap scalar/list outputs safely.
+            results[key] = {"summary": content_to_text(value)}
+
         if not isinstance(results.get("plan"), dict):
-            results["plan"] = {"just_chat": True, "plan": "respond conversationally"}
+            inferred_plan = {}
+            planner_keys = (
+                "plan",
+                "notes_for_main",
+                "load_memories",
+                "load_skills",
+                "use_sub_agents",
+                "sub_agent_tasks",
+                "just_chat",
+            )
+            for key in planner_keys:
+                if key in results:
+                    inferred_plan[key] = results.get(key)
+            if inferred_plan and isinstance(inferred_plan.get("plan"), str):
+                results["plan"] = inferred_plan
+            else:
+                results["plan"] = {"just_chat": True, "plan": "respond conversationally"}
         if on_agent_complete:
             for name, res in results.items():
                 await on_agent_complete(name, res)
