@@ -1,0 +1,24 @@
+2026-02-14 08:37:47,645 - asyncio - DEBUG - Using selector: EpollSelector
+INFO:     Started server process [6194]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+✅ Loaded agent config from config.json
+INFO:     127.0.0.1:38796 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38796 - "GET /api/providers HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38796 - "GET /api/config HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38796 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38796 - "GET /api/sessions/6f253476-4b54-412d-8971-240da11b03f9 HTTP/1.1" 200 OK
+2026-02-14 08:37:53,516 - __main__ - DEBUG - Config in endpoint: meta=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) main=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) sub=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) parallel_meta_calls=True
+INFO:     127.0.0.1:38796 - "POST /api/chat/stream HTTP/1.1" 200 OK
+/app/main.py:115: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return datetime.utcnow().isoformat()
+2026-02-14 08:37:53,534 - __main__ - INFO -   [GATE] Working memory updated for session 6f253476-4b54-412d-8971-240da11b03f9
+INFO:     127.0.0.1:59712 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59712 - "GET /api/providers HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59712 - "GET /api/config HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59712 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59712 - "GET /api/sessions/6f253476-4b54-412d-8971-240da11b03f9 HTTP/1.1" 200 OK
+2026-02-14 08:39:14,584 - __main__ - DEBUG - Config in endpoint: meta=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) main=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) sub=ProviderConfig(provider='OpenAI', provider_type='openai_compatible', model='gpt-4', api_key='dummy-key', base_url='https://api.openai.com/v1/chat/completions', headers=None, supports_tools=True, supports_response_format=True) parallel_meta_calls=True
+INFO:     127.0.0.1:59712 - "POST /api/chat/stream HTTP/1.1" 200 OK
+2026-02-14 08:39:14,597 - __main__ - INFO -   [GATE] Working memory updated for session 6f253476-4b54-412d-8971-240da11b03f9

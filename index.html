@@ -1058,6 +1058,7 @@ let tempSessions = [];
 let liveMessageDiv = null;
 let liveToolEvents = [];
 let liveSubagents = [];
+let liveMeta = {};
 let pendingMeta = null;
 let pendingToolEvents = [];
 let pendingSubagents = [];
@@ -1121,7 +1122,23 @@ function startLiveMessage(){
   chat.appendChild(liveMessageDiv);
   liveToolEvents = [];
   liveSubagents = [];
+  // liveMeta is already being populated by meta_partial
+  updateLiveDetails();
   chat.scrollTop = chat.scrollHeight;
+}
+
+function updateLiveMetaDetails() {
+  if(!liveMessageDiv) {
+    const progressBanner = document.getElementById("progressBanner");
+    if(progressBanner) {
+        const keys = Object.keys(liveMeta).filter(k => k !== 'plan' && k !== 'gatekeeper');
+        if(keys.length > 0) {
+            progressBanner.textContent = "Meta Agents: " + keys.join(", ") + "...";
+        }
+    }
+  } else {
+    updateLiveDetails();
+  }
 }
 
 function updateLiveMessage(content){
@@ -1136,8 +1153,8 @@ function updateLiveDetails(){
   if(existingDetails){
     existingDetails.remove();
   }
-  if(liveToolEvents.length > 0 || liveSubagents.length > 0){
-    const detailsHTML = buildDetailsHTML(null, liveToolEvents, liveSubagents);
+  if(Object.keys(liveMeta).length > 0 || liveToolEvents.length > 0 || liveSubagents.length > 0){
+    const detailsHTML = buildDetailsHTML(liveMeta, liveToolEvents, liveSubagents);
     liveMessageDiv.insertAdjacentHTML("beforeend", detailsHTML);
   }
   chat.scrollTop = chat.scrollHeight;
@@ -1366,6 +1383,7 @@ async function handleSend(){
   addMessage(text,"user");
   showThinking();
   pendingMeta = null;
+  liveMeta = {};
   pendingToolEvents = [];
   pendingSubagents = [];
   try{
@@ -1431,15 +1449,24 @@ function handleSSEEvent(eventType, payload){
   if(eventType === "stage"){
     const name = payload.name || "";
     const map = {
-      "meta_start": "Meta Agent",
-      "subagents_start": "Subagents",
-      "tools_start": "Tools"
+      "meta_start": "Meta Agents Thinking...",
+      "planning_start": "System Planner...",
+      "gatekeeper_start": "Gatekeeper...",
+      "subagents_start": "Subagents...",
+      "tools_start": "Tools..."
     };
     showProgress(map[name] || name);
     return;
   }
+  if(eventType === "meta_partial"){
+    liveMeta = {...liveMeta, ...payload};
+    updateLiveMetaDetails();
+    return;
+  }
   if(eventType === "meta"){
     pendingMeta = payload;
+    liveMeta = payload;
+    updateLiveMetaDetails();
     return;
   }
   if(eventType === "token"){
