@@ -108,14 +108,11 @@ Complex tasks can be split across specialized sub-agents with:
 ## Installation
 
 ```bash
-# Clone or download the project
-cd agentic-gateway
+# Open the folder
+cd OpenAgent
 
 # Install dependencies
 pip install -r requirements.txt
-
-# Copy the frontend HTML
-cp index.html .
 ```
 
 ## Configuration
@@ -642,6 +639,7 @@ This is a framework for intelligent, adaptive assistance. Customize it:
 - Extend memory structure
 - Add new providers
 - Enhance meta-analysis
+Consider submitting a PR to help the project grow!
 
 ## License
 
