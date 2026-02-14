@@ -3,10 +3,10 @@ Agentic Gateway Backend
 Multi-provider LLM orchestration with Meta, Main, and Sub agents
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Dict, Any, Literal, Tuple
+from typing import Optional, List, Dict, Any, Literal, Tuple, Callable, Awaitable
 import asyncio
 import httpx
 import json
@@ -159,7 +159,6 @@ class AgentConfig(BaseModel):
     meta: ProviderConfig
     main: ProviderConfig
     sub: ProviderConfig
-    parallel_meta_calls: bool = True
 
 
 class ChatMessage(BaseModel):
@@ -227,6 +226,7 @@ class ToolApprovalRequest(BaseModel):
 
 config: Optional[AgentConfig] = None
 pending_approvals: Dict[str, Dict[str, Any]] = {}
+rate_limit_decisions: Dict[str, asyncio.Queue] = {}
 session_policies: Dict[str, Dict[str, Any]] = {}
 temp_sessions: Dict[str, Dict[str, Any]] = {}
 
@@ -456,11 +456,45 @@ class LLMProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
+        on_rate_limit: Optional[Callable[[int], Awaitable[None]]] = None,
+        on_user_decision_required: Optional[Callable[[], Awaitable[str]]] = None
     ) -> Dict[str, Any]:
-        if provider_config.provider_type == "openai_compatible":
-            return await LLMProvider._call_openai_compatible(provider_config, messages, tools, response_format)
-        else:
-            return await LLMProvider._call_anthropic(provider_config, messages, tools)
+        # Small delay to avoid aggressive rate limits
+        await asyncio.sleep(0.5)
+
+        try:
+            if provider_config.provider_type == "openai_compatible":
+                return await LLMProvider._call_openai_compatible(provider_config, messages, tools, response_format)
+            else:
+                return await LLMProvider._call_anthropic(provider_config, messages, tools)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                logger.warning(f"Rate limit hit for provider {provider_config.provider}. Retrying in 30s...")
+                if on_rate_limit:
+                    await on_rate_limit(30)
+
+                await asyncio.sleep(30)
+
+                try:
+                    if provider_config.provider_type == "openai_compatible":
+                        return await LLMProvider._call_openai_compatible(provider_config, messages, tools, response_format)
+                    else:
+                        return await LLMProvider._call_anthropic(provider_config, messages, tools)
+                except httpx.HTTPStatusError as exc2:
+                    if exc2.response.status_code == 429:
+                        if on_user_decision_required:
+                            logger.info("Rate limit hit again. Waiting for user decision.")
+                            decision = await on_user_decision_required()
+                            if decision == "continue":
+                                return await LLMProvider.call(provider_config, messages, tools, response_format, on_rate_limit, on_user_decision_required)
+                            else:
+                                raise exc2
+                        else:
+                            raise exc2
+                    else:
+                        raise exc2
+            else:
+                raise exc
 
     @staticmethod
     async def _call_openai_compatible(
@@ -1246,7 +1280,7 @@ def store_turn(
 # AGENT ORCHESTRATION
 # =============================================================================
 
-async def run_meta_layer(session_context: str, skills_index: str, memory_context: str, on_agent_complete: Optional[Any] = None) -> Dict[str, Any]:
+async def run_meta_layer(session_context: str, skills_index: str, memory_context: str, on_agent_complete: Optional[Any] = None, **kwargs) -> Dict[str, Any]:
     meta_agents = {
         "intent": "prompts/meta_intent.txt",
         "tone": "prompts/meta_tone.txt",
@@ -1256,67 +1290,35 @@ async def run_meta_layer(session_context: str, skills_index: str, memory_context
         "patterns": "prompts/meta_patterns.txt",
     }
     
-    results = {}
+    combined_prompt = "You are a meta-analysis system. Perform the following 6 analyses on the conversation and output a single JSON object with keys: intent, tone, user, subject, needs, patterns.\n\n"
+    for name, path in meta_agents.items():
+        prompt = Path(path).read_text()
+        if name == "needs":
+            prompt = prompt.replace("{skills_index}", skills_index)
+        combined_prompt += f"--- {name.upper()} ---\n{prompt}\n\n"
 
-    if config.parallel_meta_calls:
-        async def call_agent(name, prompt_path):
-            prompt = Path(prompt_path).read_text()
-            if name == "needs":
-                prompt = prompt.replace("{skills_index}", skills_index)
+    system_prompt = f"{combined_prompt}\n\n{memory_context}"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": session_context}
+    ]
 
-            system_prompt = f"{prompt}\n\n{memory_context}"
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": session_context}
-            ]
-            try:
-                resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
-                content = resp["choices"][0]["message"]["content"]
-                res = json.loads(content)
-                if on_agent_complete:
-                    await on_agent_complete(name, res)
-                return name, res
-            except Exception as e:
-                logger.error(f"Error in meta agent {name}: {e}")
-                err_res = {"error": str(e)}
-                if on_agent_complete:
-                    await on_agent_complete(name, err_res)
-                return name, err_res
+    try:
+        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
+        content = resp["choices"][0]["message"]["content"]
+        results = json.loads(content)
+        if on_agent_complete:
+            for name, res in results.items():
+                await on_agent_complete(name, res)
+        return results
+    except Exception as e:
+        logger.error(f"Error in combined meta agent call: {e}")
+        results = {"error": str(e)}
+        if on_agent_complete:
+            await on_agent_complete("error", results)
+        return results
 
-        tasks = [call_agent(name, path) for name, path in meta_agents.items()]
-        completed = await asyncio.gather(*tasks)
-        for name, result in completed:
-            results[name] = result
-    else:
-        # Combined call
-        combined_prompt = "You are a meta-analysis system. Perform the following 6 analyses on the conversation and output a single JSON object with keys: intent, tone, user, subject, needs, patterns.\n\n"
-        for name, path in meta_agents.items():
-            prompt = Path(path).read_text()
-            if name == "needs":
-                prompt = prompt.replace("{skills_index}", skills_index)
-            combined_prompt += f"--- {name.upper()} ---\n{prompt}\n\n"
-        
-        system_prompt = f"{combined_prompt}\n\n{memory_context}"
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": session_context}
-        ]
-        try:
-            resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
-            content = resp["choices"][0]["message"]["content"]
-            results = json.loads(content)
-            if on_agent_complete:
-                for name, res in results.items():
-                    await on_agent_complete(name, res)
-        except Exception as e:
-            logger.error(f"Error in combined meta agent call: {e}")
-            results = {"error": str(e)}
-            if on_agent_complete:
-                await on_agent_complete("error", results)
-
-    return results
-
-async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, skills_index: str) -> Dict[str, Any]:
+async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, skills_index: str, **kwargs) -> Dict[str, Any]:
     prompt = Path("prompts/planner.txt").read_text()
     context = f"META ANALYSIS:\n{json.dumps(meta_output, indent=2)}\n\nWORKING MEMORY:\n{working_memory}\n\nAVAILABLE SKILLS:\n{skills_index}"
 
@@ -1326,14 +1328,14 @@ async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, sk
     ]
 
     try:
-        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
         content = resp["choices"][0]["message"]["content"]
         return json.loads(content)
     except Exception as e:
         logger.error(f"Error in planner layer: {e}")
         return {"error": str(e), "just_chat": True, "plan": "respond conversationally"}
 
-async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: str, identity_md: str) -> Dict[str, Any]:
+async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: str, identity_md: str, **kwargs) -> Dict[str, Any]:
     prompt = Path("prompts/gatekeeper.txt").read_text()
     context = f"CONVERSATION:\n{conversation}\n\nAGENT RESPONSE:\n{agent_response}\n\nCURRENT USER.MD:\n{user_md}\n\nCURRENT IDENTITY.MD:\n{identity_md}"
 
@@ -1343,7 +1345,7 @@ async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: 
     ]
 
     try:
-        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"})
+        resp = await LLMProvider.call(config.meta, messages, response_format={"type": "json_object"}, **kwargs)
         content = resp["choices"][0]["message"]["content"]
         return json.loads(content)
     except Exception as e:
@@ -1442,11 +1444,12 @@ async def run_tool_loop(
     approval_mode: Literal["ask", "allow", "auto_deny"],
     allow_shell: bool,
     user_message: str,
+    **kwargs
 ) -> Dict[str, Any]:
     tool_events: List[Dict[str, Any]] = []
     subagent_outputs: List[Dict[str, Any]] = []
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await LLMProvider.call(provider_cfg, messages, tools=tools)
+        response = await LLMProvider.call(provider_cfg, messages, tools=tools, **kwargs)
         assistant_msg = response["choices"][0]["message"]
         tool_calls = assistant_msg.get("tool_calls")
         if tool_calls:
@@ -1540,7 +1543,7 @@ async def run_tool_loop(
     }
 
 
-async def run_subagents(subagents_spec: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def run_subagents(subagents_spec: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
     if not subagents_spec:
         return []
 
@@ -1568,6 +1571,7 @@ async def run_subagents(subagents_spec: List[Dict[str, Any]]) -> List[Dict[str, 
             approval_mode="auto_deny",
             allow_shell=False,
             user_message="",
+            **kwargs
         )
         return {
             "role": role,
@@ -1714,216 +1718,252 @@ async def chat_stream(request: ChatRequest):
     ensure_session_policy(session_id)
     persistent = session_id not in temp_sessions
 
-    async def event_generator():
-        yield sse_event("stage", {"name": "meta_start"})
-        session_history, working_memory = build_session_context(session_id)
-        subagent_outputs: List[Dict[str, Any]] = []
-        # Include current message in context for analysis
-        session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
+    event_queue = asyncio.Queue()
 
-        skills_list = list_available_skills()
-        skills_index = ", ".join(skills_list) if skills_list else "none"
-        memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
+    async def queue_event(event, data):
+        await event_queue.put((event, data))
 
-        # Layer 1: Root Meta
-        queue = asyncio.Queue()
-        async def on_meta_complete(name, result):
-            await queue.put((name, result))
+    async def on_rate_limit_callback(seconds):
+        await queue_event("rate_limit_retry", {"seconds": seconds})
 
-        meta_task = asyncio.create_task(run_meta_layer(session_context, skills_index, memory_context, on_meta_complete))
+    async def on_user_decision_callback():
+        await queue_event("rate_limit_error", {"session_id": session_id})
+        if session_id not in rate_limit_decisions:
+            rate_limit_decisions[session_id] = asyncio.Queue()
+        decision = await rate_limit_decisions[session_id].get()
+        return decision
 
-        meta_results = {}
-        agents_count = 6 if config.parallel_meta_calls else 1
-        # If combined call, it might return all 6 in one go, so agents_count=1 is better for the loop
-        # But wait, my run_meta_layer calls on_meta_complete for each item in the results dict.
-        # So it will still be 6 calls to the queue.
-        # Let's adjust agents_count to be the expected number of items in the queue.
-        expected_items = 6 if config.parallel_meta_calls else 6 # In both cases we expect 6 results
-        # actually if error it might be less.
-        # I'll use a safer approach.
+    call_kwargs = {
+        "on_rate_limit": on_rate_limit_callback,
+        "on_user_decision_required": on_user_decision_callback
+    }
 
-        while len(meta_results) < 6:
-            try:
-                name, result = await asyncio.wait_for(queue.get(), timeout=30.0)
-                if name == "error":
-                    meta_results["error"] = result
-                    break
-                meta_results[name] = result
-                yield sse_event("meta_partial", {name: result})
-            except asyncio.TimeoutError:
-                break
+    async def run_orchestration():
+        try:
+            await queue_event("stage", {"name": "meta_start"})
+            session_history, working_memory = build_session_context(session_id)
+            subagent_outputs: List[Dict[str, Any]] = []
+            # Include current message in context for analysis
+            session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
 
-        await meta_task
+            skills_list = list_available_skills()
+            skills_index = ", ".join(skills_list) if skills_list else "none"
+            memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
 
-        # Layer 2: Planner
-        yield sse_event("stage", {"name": "planning_start"})
-        plan_result = await run_planner_layer(meta_results, working_memory, skills_index)
-        yield sse_event("meta_partial", {"plan": plan_result})
+            # Layer 1: Root Meta
+            meta_results = await run_meta_layer(session_context, skills_index, memory_context, **call_kwargs)
+            for name, result in meta_results.items():
+                await queue_event("meta_partial", {name: result})
 
-        meta_output = MetaOutput(
-            intent=meta_results.get("intent"),
-            tone=meta_results.get("tone"),
-            user=meta_results.get("user"),
-            subject=meta_results.get("subject"),
-            needs=meta_results.get("needs"),
-            patterns=meta_results.get("patterns"),
-            plan=plan_result
-        )
-        yield sse_event("meta", meta_output.model_dump())
+            # Layer 2: Planner
+            await queue_event("stage", {"name": "planning_start"})
+            plan_result = await run_planner_layer(meta_results, working_memory, skills_index, **call_kwargs)
+            await queue_event("meta_partial", {"plan": plan_result})
 
-        # Load requested context from planner
-        loaded_context = ""
-        if plan_result.get("load_memories"):
-            for query in plan_result["load_memories"]:
-                results = await execute_tool("memory_search", {"query": query})
-                loaded_context += f"Memory search '{query}': {results}\n"
+            meta_output = MetaOutput(
+                intent=meta_results.get("intent"),
+                tone=meta_results.get("tone"),
+                user=meta_results.get("user"),
+                subject=meta_results.get("subject"),
+                needs=meta_results.get("needs"),
+                patterns=meta_results.get("patterns"),
+                plan=plan_result
+            )
+            await queue_event("meta", meta_output.model_dump())
 
-        if plan_result.get("load_skills"):
-            for skill in plan_result["load_skills"]:
-                content = await execute_tool("skill_load", {"name": skill})
-                loaded_context += f"Skill '{skill}': {content}\n"
+            # Load requested context from planner
+            loaded_context = ""
+            if plan_result.get("load_memories"):
+                for query in plan_result["load_memories"]:
+                    results = await execute_tool("memory_search", {"query": query})
+                    loaded_context += f"Memory search '{query}': {results}\n"
 
-        # Sub agents triggered by planner
-        if plan_result.get("use_sub_agents"):
-            yield sse_event("stage", {"name": "subagents_start"})
-            sub_tasks = plan_result.get("sub_agent_tasks", [])
-            sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
-            outputs = await run_subagents(sub_specs)
-            subagent_outputs.extend(outputs)
-            for output in outputs:
-                yield sse_event("subagent", output)
-                loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
+            if plan_result.get("load_skills"):
+                for skill in plan_result["load_skills"]:
+                    content = await execute_tool("skill_load", {"name": skill})
+                    loaded_context += f"Skill '{skill}': {content}\n"
 
-        history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
-        messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
+            # Sub agents triggered by planner
+            if plan_result.get("use_sub_agents"):
+                await queue_event("stage", {"name": "subagents_start"})
+                sub_tasks = plan_result.get("sub_agent_tasks", [])
+                sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
+                outputs = await run_subagents(sub_specs, **call_kwargs)
+                subagent_outputs.extend(outputs)
+                for output in outputs:
+                    await queue_event("subagent", output)
+                    loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
 
-        shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
-        tool_events: List[Dict[str, Any]] = []
-        tools_started = False
+            history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
+            messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
 
-        for _ in range(MAX_TOOL_ROUNDS):
-            response = await LLMProvider.call(config.main, messages, tools=TOOLS_SPEC)
-            assistant_msg = response["choices"][0]["message"]
-            tool_calls = assistant_msg.get("tool_calls")
+            shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
+            tool_events: List[Dict[str, Any]] = []
+            tools_started = False
 
-            if tool_calls:
-                for tool_call in tool_calls:
-                    if not tool_call.get("id"):
-                        tool_call["id"] = f"call_{uuid.uuid4()}"
+            for _ in range(MAX_TOOL_ROUNDS):
+                response = await LLMProvider.call(config.main, messages, tools=TOOLS_SPEC, **call_kwargs)
+                assistant_msg = response["choices"][0]["message"]
+                tool_calls = assistant_msg.get("tool_calls")
 
-                def needs_approval(tc: Dict[str, Any]) -> bool:
-                    fn = tc.get("function", {})
-                    if fn.get("name") != "shell_command":
-                        return False
-                    try:
-                        args = json.loads(fn.get("arguments") or "{}")
-                    except Exception:
-                        args = {}
-                    cmd = args.get("command", "")
-                    return should_allow_shell(cmd, request.message) and not shell_allowed
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        if not tool_call.get("id"):
+                            tool_call["id"] = f"call_{uuid.uuid4()}"
 
-                if any(needs_approval(tc) for tc in tool_calls):
-                    pending_messages = messages + [{
+                    def needs_approval(tc: Dict[str, Any]) -> bool:
+                        fn = tc.get("function", {})
+                        if fn.get("name") != "shell_command":
+                            return False
+                        try:
+                            args = json.loads(fn.get("arguments") or "{}")
+                        except Exception:
+                            args = {}
+                        cmd = args.get("command", "")
+                        return should_allow_shell(cmd, request.message) and not shell_allowed
+
+                    if any(needs_approval(tc) for tc in tool_calls):
+                        pending_messages = messages + [{
+                            "role": "assistant",
+                            "content": assistant_msg.get("content", ""),
+                            "tool_calls": tool_calls,
+                        }]
+                        pending_approvals[session_id] = {
+                            "messages": pending_messages,
+                            "tool_calls": tool_calls,
+                            "tool_events": tool_events,
+                            "user_message": request.message,
+                            "meta_json": meta_output.model_dump(),
+                            "subagent_outputs": subagent_outputs,
+                            "persistent": persistent,
+                        }
+                        pending_tools = [
+                            {
+                                "id": tc.get("id"),
+                                "name": tc.get("function", {}).get("name"),
+                                "arguments": tc.get("function", {}).get("arguments", "{}"),
+                            }
+                            for tc in tool_calls
+                        ]
+                        await queue_event("needs_approval", {
+                            "pending_tools": pending_tools,
+                            "meta": meta_output.model_dump(),
+                            "tool_events": [
+                                {
+                                    "id": ev.get("id"),
+                                    "name": ev["name"],
+                                    "args": ev["args"],
+                                    "status": ev["status"],
+                                    "result": truncate(ev["result"]),
+                                    "created_at": ev["created_at"],
+                                }
+                                for ev in tool_events
+                            ],
+                            "session_id": session_id,
+                        })
+                        await event_queue.put(None)
+                        return
+
+                    if not tools_started:
+                        await queue_event("stage", {"name": "tools_start"})
+                        tools_started = True
+
+                    messages.append({
                         "role": "assistant",
                         "content": assistant_msg.get("content", ""),
                         "tool_calls": tool_calls,
-                    }]
-                    pending_approvals[session_id] = {
-                        "messages": pending_messages,
-                        "tool_calls": tool_calls,
-                        "tool_events": tool_events,
-                        "user_message": request.message,
-                        "meta_json": meta_output.model_dump(),
-                        "subagent_outputs": subagent_outputs,
-                        "persistent": persistent,
-                    }
-                    pending_tools = [
+                    })
+
+                    for tool_call in tool_calls:
+                        fn = tool_call.get("function", {})
+                        name = fn.get("name")
+                        args_raw = fn.get("arguments", "{}")
+                        try:
+                            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                        except Exception:
+                            args = {}
+
+                        await queue_event("tool_call", {"name": name, "args": args})
+
+                        if name == "shell_command" and not should_allow_shell(args.get("command", ""), request.message):
+                            result = "Tool rejected: not necessary. Respond directly without tools."
+                            status = "rejected"
+                        elif name == "shell_command" and not shell_allowed:
+                            result = "DENIED: shell_command is not allowed for this agent."
+                            status = "denied"
+                        elif name == "spawn_subagents":
+                            await queue_event("stage", {"name": "subagents_start"})
+                            subagents_spec = args.get("subagents", [])
+                            outputs = await run_subagents(subagents_spec, **call_kwargs)
+                            subagent_outputs.extend(outputs)
+                            for output in outputs:
+                                await queue_event("subagent", output)
+                            result = json.dumps(outputs, indent=2)
+                            status = "ok"
+                        else:
+                            result = await execute_tool(name, args)
+                            status = "error" if result.startswith("Tool execution error") else "ok"
+
+                        tool_events.append({
+                            "id": None,
+                            "name": name,
+                            "args": args,
+                            "result": result,
+                            "status": status,
+                            "created_at": now_iso(),
+                        })
+                        await queue_event("tool_result", {
+                            "name": name,
+                            "status": status,
+                            "result": truncate(result),
+                        })
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id"),
+                            "content": result,
+                        })
+                    continue
+
+                reply = assistant_msg.get("content", "")
+                store_turn(
+                    session_id=session_id,
+                    persistent=persistent,
+                    user_message=request.message,
+                    assistant_reply=reply,
+                    meta_json=meta_output.model_dump(),
+                    tool_events=tool_events,
+                    subagent_outputs=subagent_outputs,
+                )
+                # Layer 5: Gatekeeper
+                await queue_event("stage", {"name": "gatekeeper_start"})
+                user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+                identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+                gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md, **call_kwargs)
+                await apply_gatekeeper(session_id, persistent, gate_result)
+                meta_output.gatekeeper = gate_result
+
+                await queue_event("assistant", {
+                    "content": reply,
+                    "meta": meta_output.model_dump(),
+                    "tool_events": [
                         {
-                            "id": tc.get("id"),
-                            "name": tc.get("function", {}).get("name"),
-                            "arguments": tc.get("function", {}).get("arguments", "{}"),
+                            "id": ev.get("id"),
+                            "name": ev["name"],
+                            "args": ev["args"],
+                            "status": ev["status"],
+                            "result": truncate(ev["result"]),
+                            "created_at": ev["created_at"],
                         }
-                        for tc in tool_calls
-                    ]
-                    yield sse_event("needs_approval", {
-                        "pending_tools": pending_tools,
-                        "meta": meta_output.model_dump(),
-                        "tool_events": [
-                            {
-                                "id": ev.get("id"),
-                                "name": ev["name"],
-                                "args": ev["args"],
-                                "status": ev["status"],
-                                "result": truncate(ev["result"]),
-                                "created_at": ev["created_at"],
-                            }
-                            for ev in tool_events
-                        ],
-                        "session_id": session_id,
-                    })
-                    return
-
-                if not tools_started:
-                    yield sse_event("stage", {"name": "tools_start"})
-                    tools_started = True
-
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_msg.get("content", ""),
-                    "tool_calls": tool_calls,
+                        for ev in tool_events
+                    ],
+                    "subagent_outputs": subagent_outputs,
+                    "session_id": session_id,
                 })
+                await queue_event("done", {"session_id": session_id})
+                await event_queue.put(None)
+                return
 
-                for tool_call in tool_calls:
-                    fn = tool_call.get("function", {})
-                    name = fn.get("name")
-                    args_raw = fn.get("arguments", "{}")
-                    try:
-                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    except Exception:
-                        args = {}
-
-                    yield sse_event("tool_call", {"name": name, "args": args})
-
-                    if name == "shell_command" and not should_allow_shell(args.get("command", ""), request.message):
-                        result = "Tool rejected: not necessary. Respond directly without tools."
-                        status = "rejected"
-                    elif name == "shell_command" and not shell_allowed:
-                        result = "DENIED: shell_command is not allowed for this agent."
-                        status = "denied"
-                    elif name == "spawn_subagents":
-                        yield sse_event("stage", {"name": "subagents_start"})
-                        subagents_spec = args.get("subagents", [])
-                        outputs = await run_subagents(subagents_spec)
-                        subagent_outputs.extend(outputs)
-                        for output in outputs:
-                            yield sse_event("subagent", output)
-                        result = json.dumps(outputs, indent=2)
-                        status = "ok"
-                    else:
-                        result = await execute_tool(name, args)
-                        status = "error" if result.startswith("Tool execution error") else "ok"
-
-                    tool_events.append({
-                        "id": None,
-                        "name": name,
-                        "args": args,
-                        "result": result,
-                        "status": status,
-                        "created_at": now_iso(),
-                    })
-                    yield sse_event("tool_result", {
-                        "name": name,
-                        "status": status,
-                        "result": truncate(result),
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.get("id"),
-                        "content": result,
-                    })
-                continue
-
-            reply = assistant_msg.get("content", "")
+            reply = ""
             store_turn(
                 session_id=session_id,
                 persistent=persistent,
@@ -1933,15 +1973,7 @@ async def chat_stream(request: ChatRequest):
                 tool_events=tool_events,
                 subagent_outputs=subagent_outputs,
             )
-            # Layer 5: Gatekeeper
-            yield sse_event("stage", {"name": "gatekeeper_start"})
-            user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
-            identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
-            gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
-            await apply_gatekeeper(session_id, persistent, gate_result)
-            meta_output.gatekeeper = gate_result
-
-            yield sse_event("assistant", {
+            await queue_event("assistant", {
                 "content": reply,
                 "meta": meta_output.model_dump(),
                 "tool_events": [
@@ -1958,37 +1990,26 @@ async def chat_stream(request: ChatRequest):
                 "subagent_outputs": subagent_outputs,
                 "session_id": session_id,
             })
-            yield sse_event("done", {"session_id": session_id})
-            return
+            await queue_event("done", {"session_id": session_id})
+            await event_queue.put(None)
+        except Exception as e:
+            logger.error(f"Error in orchestration: {e}")
+            await queue_event("error", {"detail": str(e)})
+            await event_queue.put(None)
 
-        reply = ""
-        store_turn(
-            session_id=session_id,
-            persistent=persistent,
-            user_message=request.message,
-            assistant_reply=reply,
-            meta_json=meta_output.model_dump(),
-            tool_events=tool_events,
-            subagent_outputs=subagent_outputs,
-        )
-        yield sse_event("assistant", {
-            "content": reply,
-            "meta": meta_output.model_dump(),
-            "tool_events": [
-                {
-                    "id": ev.get("id"),
-                    "name": ev["name"],
-                    "args": ev["args"],
-                    "status": ev["status"],
-                    "result": truncate(ev["result"]),
-                    "created_at": ev["created_at"],
-                }
-                for ev in tool_events
-            ],
-            "subagent_outputs": subagent_outputs,
-            "session_id": session_id,
-        })
-        yield sse_event("done", {"session_id": session_id})
+    async def event_generator():
+        orchestration_task = asyncio.create_task(run_orchestration())
+        try:
+            while True:
+                item = await event_queue.get()
+                if item is None:
+                    break
+                event, data = item
+                yield sse_event(event, data)
+        finally:
+            if not orchestration_task.done():
+                orchestration_task.cancel()
+            rate_limit_decisions.pop(session_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -2287,6 +2308,14 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
         status="ok",
         session_id=request.session_id,
     )
+
+
+@app.post("/api/chat/decision")
+async def chat_decision(session_id: str = Body(embed=True), decision: str = Body(embed=True)):
+    if session_id in rate_limit_decisions:
+        await rate_limit_decisions[session_id].put(decision)
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="No pending rate limit decision for this session")
 
 
 @app.get("/")
