@@ -1342,7 +1342,14 @@ def store_turn(
 # AGENT ORCHESTRATION
 # =============================================================================
 
-async def run_meta_layer(session_context: str, skills_index: str, memory_context: str, on_agent_complete: Optional[Any] = None, **kwargs) -> Dict[str, Any]:
+async def run_meta_layer(
+    session_context: str,
+    skills_index: str,
+    memory_context: str,
+    working_memory: str,
+    on_agent_complete: Optional[Any] = None,
+    **kwargs
+) -> Dict[str, Any]:
     meta_agents = {
         "intent": "prompts/meta_intent.txt",
         "tone": "prompts/meta_tone.txt",
@@ -1352,17 +1359,36 @@ async def run_meta_layer(session_context: str, skills_index: str, memory_context
         "patterns": "prompts/meta_patterns.txt",
     }
     
-    combined_prompt = "You are a meta-analysis system. Perform the following 6 analyses on the conversation and output a single JSON object with keys: intent, tone, user, subject, needs, patterns.\n\n"
+    planner_prompt = Path("prompts/planner.txt").read_text()
+
+    combined_prompt = (
+        "You are a meta-analysis and planning system.\n"
+        "Perform 6 analyses and generate a planner decision in one response.\n"
+        "Output a single JSON object with keys: intent, tone, user, subject, needs, patterns, plan.\n"
+        "The 'plan' key must be an object.\n\n"
+    )
     for name, path in meta_agents.items():
         prompt = Path(path).read_text()
         if name == "needs":
             prompt = prompt.replace("{skills_index}", skills_index)
         combined_prompt += f"--- {name.upper()} ---\n{prompt}\n\n"
 
+    combined_prompt += (
+        "--- PLANNER ---\n"
+        f"{planner_prompt}\n\n"
+        "Planner constraints:\n"
+        "1. Base decisions on the 6 analyses.\n"
+        "2. Keep plan fields compatible with existing schema.\n"
+        "3. Prefer just_chat=true unless tools/subagents are clearly needed.\n"
+    )
+
     system_prompt = f"{combined_prompt}\n\n{memory_context}"
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": session_context}
+        {
+            "role": "user",
+            "content": f"{session_context}\n\nWORKING MEMORY:\n{working_memory}\n\nAVAILABLE SKILLS:\n{skills_index}"
+        }
     ]
 
     try:
@@ -1370,6 +1396,10 @@ async def run_meta_layer(session_context: str, skills_index: str, memory_context
         resp = await LLMProvider.call(config.meta, messages, **kwargs)
         content = content_to_text(resp["choices"][0]["message"]["content"])
         results = robust_json_loads(content)
+        if not isinstance(results, dict):
+            results = {"raw": content}
+        if not isinstance(results.get("plan"), dict):
+            results["plan"] = {"just_chat": True, "plan": "respond conversationally"}
         if on_agent_complete:
             for name, res in results.items():
                 await on_agent_complete(name, res)
@@ -1816,15 +1846,19 @@ async def chat_stream(request: ChatRequest):
             skills_index = ", ".join(skills_list) if skills_list else "none"
             memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
 
-            # Layer 1: Root Meta
-            meta_results = await run_meta_layer(session_context, skills_index, memory_context, **call_kwargs)
-            for name, result in meta_results.items():
-                await queue_event("meta_partial", {name: result})
+            # Layer 1+2: Combined Meta + Planner
+            meta_results = await run_meta_layer(
+                session_context,
+                skills_index,
+                memory_context,
+                working_memory,
+                **call_kwargs,
+            )
+            await queue_event("meta_partial", meta_results)
 
-            # Layer 2: Planner
-            await queue_event("stage", {"name": "planning_start"})
-            plan_result = await run_planner_layer(meta_results, working_memory, skills_index, **call_kwargs)
-            await queue_event("meta_partial", {"plan": plan_result})
+            plan_result = meta_results.get("plan")
+            if not isinstance(plan_result, dict):
+                plan_result = {"just_chat": True, "plan": "respond conversationally"}
 
             meta_output = MetaOutput(
                 intent=meta_results.get("intent"),
@@ -2103,8 +2137,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
     skills_index = ", ".join(skills_list) if skills_list else "none"
     memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
 
-    meta_results = await run_meta_layer(session_context, skills_index, memory_context)
-    plan_result = await run_planner_layer(meta_results, working_memory, skills_index)
+    meta_results = await run_meta_layer(session_context, skills_index, memory_context, working_memory)
+    plan_result = meta_results.get("plan")
+    if not isinstance(plan_result, dict):
+        plan_result = {"just_chat": True, "plan": "respond conversationally"}
 
     meta_output = MetaOutput(
         intent=meta_results.get("intent"),

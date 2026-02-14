@@ -636,7 +636,8 @@ button.danger {
   height: 100%;
   background: linear-gradient(90deg, var(--accent-gold), var(--accent-amber));
   width: 0%;
-  transition: width 0.5s ease;
+  transition: width 0.12s linear;
+  will-change: width;
   box-shadow: 0 0 10px var(--glow);
 }
 
@@ -1151,6 +1152,52 @@ let pendingMeta = null;
 let pendingToolEvents = [];
 let pendingSubagents = [];
 let providers = {};
+let progressCurrent = 0;
+let progressTarget = 0;
+let progressRaf = null;
+let progressTicker = null;
+
+function renderProgress(){
+  progressBarFill.style.width = progressCurrent.toFixed(1) + "%";
+  progressPercent.textContent = Math.round(progressCurrent) + "%";
+}
+
+function animateProgress(){
+  const diff = progressTarget - progressCurrent;
+  if(Math.abs(diff) < 0.1){
+    progressCurrent = progressTarget;
+    renderProgress();
+    progressRaf = null;
+    return;
+  }
+  progressCurrent += diff * 0.2;
+  renderProgress();
+  progressRaf = requestAnimationFrame(animateProgress);
+}
+
+function ensureProgressAnimation(){
+  if(progressRaf === null){
+    progressRaf = requestAnimationFrame(animateProgress);
+  }
+}
+
+function startProgressTicker(){
+  if(progressTicker) return;
+  progressTicker = setInterval(() => {
+    if(progressContainer.classList.contains("hidden")) return;
+    if(progressTarget < 95){
+      progressTarget = Math.min(95, progressTarget + 0.6);
+      ensureProgressAnimation();
+    }
+  }, 220);
+}
+
+function stopProgressTicker(){
+  if(progressTicker){
+    clearInterval(progressTicker);
+    progressTicker = null;
+  }
+}
 
 function showPage(page){
   document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
@@ -1175,14 +1222,27 @@ function showError(msg){
 function showProgress(msg, percent){
   if(!msg){
     progressContainer.classList.add("hidden");
+    stopProgressTicker();
+    progressCurrent = 0;
+    progressTarget = 0;
+    renderProgress();
     return;
   }
   progressContainer.classList.remove("hidden");
   progressText.textContent = msg;
-  if (percent !== undefined) {
-    progressBarFill.style.width = percent + "%";
-    progressPercent.textContent = percent + "%";
+  if (percent !== undefined && percent !== null) {
+    progressTarget = Math.max(progressTarget, Math.min(100, percent));
+    ensureProgressAnimation();
   }
+  startProgressTicker();
+}
+
+function completeProgress(){
+  progressText.textContent = "Done";
+  progressTarget = 100;
+  ensureProgressAnimation();
+  stopProgressTicker();
+  setTimeout(() => showProgress(null), 280);
 }
 
 let retryInterval = null;
@@ -1582,7 +1642,7 @@ function handleSSEEvent(eventType, payload){
   if(eventType === "stage"){
     const name = payload.name || "";
     const map = {
-      "meta_start": ["Meta Agents Thinking...", 10],
+      "meta_start": ["Meta + Planner...", 8],
       "planning_start": ["System Planner...", 30],
       "gatekeeper_start": ["Gatekeeper...", 90],
       "subagents_start": ["Subagents...", 50],
@@ -1603,17 +1663,22 @@ function handleSSEEvent(eventType, payload){
   if(eventType === "meta_partial"){
     liveMeta = {...liveMeta, ...payload};
     updateLiveMetaDetails();
+    showProgress("Meta ready...", 28);
     return;
   }
   if(eventType === "meta"){
     pendingMeta = payload;
     liveMeta = payload;
     updateLiveMetaDetails();
+    showProgress("Generating response...", 45);
     return;
   }
   if(eventType === "token"){
     const currentContent = liveMessageDiv ? liveMessageDiv.textContent : "";
     updateLiveMessage(currentContent + payload.token);
+    if(progressTarget < 85){
+      showProgress(progressText.textContent || "Generating response...", 85);
+    }
     return;
   }
   if(eventType === "tool_call"){
@@ -1651,11 +1716,12 @@ function handleSSEEvent(eventType, payload){
     if(payload.session_id){
       currentSessionId = payload.session_id;
     }
+    showProgress("Finalizing...", 98);
     finalizeAssistantMessage(payload.content, payload.meta, payload.tool_events, payload.subagent_outputs);
     return;
   }
   if(eventType === "done"){
-    showProgress(null);
+    completeProgress();
   }
 }
 
