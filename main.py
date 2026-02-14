@@ -1022,22 +1022,61 @@ async def repair_json_with_llm(provider_cfg: ProviderConfig, raw_text: str) -> O
     ]
     try:
         response = await LLMProvider.call(provider_cfg, messages, response_format={"type": "json_object"})
-        content = response["choices"][0]["message"]["content"]
+        content = content_to_text(response["choices"][0]["message"]["content"])
         return json.loads(content)
     except Exception:
         return None
 
 
-def robust_json_loads(text: str) -> Dict[str, Any]:
+def content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    text_keys = ("text", "content", "value")
+
+    def extract_from_dict(item: Dict[str, Any]) -> str:
+        for key in text_keys:
+            value = item.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
+
+    if isinstance(content, dict):
+        extracted = extract_from_dict(content)
+        logger.debug("Normalized non-string provider content from dict to text (%d chars).", len(extracted))
+        return extracted
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                extracted = extract_from_dict(item)
+                if extracted:
+                    parts.append(extracted)
+        normalized = "".join(parts)
+        logger.debug("Normalized non-string provider content from list to text (%d chars).", len(normalized))
+        return normalized
+
+    if content is None:
+        logger.debug("Normalized provider content from None to empty string.")
+    else:
+        logger.debug("Normalized provider content from %s to empty string.", type(content).__name__)
+    return ""
+
+
+def robust_json_loads(text: Any) -> Dict[str, Any]:
     """
     Attempts to parse JSON from the given text.
     If direct parsing fails, tries to extract a JSON candidate.
     If all fails, returns the raw text in a dict with a 'raw' key.
     """
-    if not text:
+    normalized_text = content_to_text(text)
+    if not normalized_text:
         return {}
 
-    cleaned_text = text.strip()
+    cleaned_text = normalized_text.strip()
 
     # Try direct parse
     try:
@@ -1225,10 +1264,11 @@ def store_turn(
     tool_events: List[Dict[str, Any]],
     subagent_outputs: List[Dict[str, Any]],
 ) -> None:
+    canonical_reply = content_to_text(assistant_reply)
     if not persistent:
         temp_sessions[session_id]["turns"].append({
             "user_message": user_message,
-            "assistant_reply": assistant_reply,
+            "assistant_reply": canonical_reply,
             "meta": meta_json,
             "tool_events": [
                 {
@@ -1257,7 +1297,7 @@ def store_turn(
         (
             session_id,
             user_message,
-            assistant_reply,
+            canonical_reply,
             json.dumps(meta_json),
             json.dumps([]),
             json.dumps(subagent_outputs),
@@ -1328,7 +1368,7 @@ async def run_meta_layer(session_context: str, skills_index: str, memory_context
     try:
         # Removed strict JSON requirement
         resp = await LLMProvider.call(config.meta, messages, **kwargs)
-        content = resp["choices"][0]["message"]["content"]
+        content = content_to_text(resp["choices"][0]["message"]["content"])
         results = robust_json_loads(content)
         if on_agent_complete:
             for name, res in results.items():
@@ -1353,7 +1393,7 @@ async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, sk
     try:
         # Removed strict JSON requirement
         resp = await LLMProvider.call(config.meta, messages, **kwargs)
-        content = resp["choices"][0]["message"]["content"]
+        content = content_to_text(resp["choices"][0]["message"]["content"])
         return robust_json_loads(content)
     except Exception as e:
         logger.error(f"Error in planner layer: {e}")
@@ -1371,7 +1411,7 @@ async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: 
     try:
         # Removed strict JSON requirement
         resp = await LLMProvider.call(config.meta, messages, **kwargs)
-        content = resp["choices"][0]["message"]["content"]
+        content = content_to_text(resp["choices"][0]["message"]["content"])
         return robust_json_loads(content)
     except Exception as e:
         logger.error(f"Error in gatekeeper layer: {e}")
@@ -1476,6 +1516,7 @@ async def run_tool_loop(
     for _ in range(MAX_TOOL_ROUNDS):
         response = await LLMProvider.call(provider_cfg, messages, tools=tools, **kwargs)
         assistant_msg = response["choices"][0]["message"]
+        assistant_content = content_to_text(assistant_msg.get("content", ""))
         tool_calls = assistant_msg.get("tool_calls")
         if tool_calls:
             for tool_call in tool_calls:
@@ -1496,7 +1537,7 @@ async def run_tool_loop(
             if approval_mode == "ask" and any(needs_approval(tc) for tc in tool_calls):
                 pending_messages = messages + [{
                     "role": "assistant",
-                    "content": assistant_msg.get("content", ""),
+                    "content": assistant_content,
                     "tool_calls": tool_calls,
                 }]
                 return {
@@ -1509,7 +1550,7 @@ async def run_tool_loop(
 
             messages.append({
                 "role": "assistant",
-                "content": assistant_msg.get("content", ""),
+                "content": assistant_content,
                 "tool_calls": tool_calls,
             })
 
@@ -1555,7 +1596,7 @@ async def run_tool_loop(
 
         return {
             "status": "ok",
-            "content": assistant_msg.get("content", ""),
+            "content": assistant_content,
             "tool_events": tool_events,
             "subagent_outputs": subagent_outputs,
         }
@@ -1830,6 +1871,7 @@ async def chat_stream(request: ChatRequest):
             for _ in range(MAX_TOOL_ROUNDS):
                 response = await LLMProvider.call(config.main, messages, tools=TOOLS_SPEC, **call_kwargs)
                 assistant_msg = response["choices"][0]["message"]
+                assistant_content = content_to_text(assistant_msg.get("content", ""))
                 tool_calls = assistant_msg.get("tool_calls")
 
                 if tool_calls:
@@ -1851,7 +1893,7 @@ async def chat_stream(request: ChatRequest):
                     if any(needs_approval(tc) for tc in tool_calls):
                         pending_messages = messages + [{
                             "role": "assistant",
-                            "content": assistant_msg.get("content", ""),
+                            "content": assistant_content,
                             "tool_calls": tool_calls,
                         }]
                         pending_approvals[session_id] = {
@@ -1896,7 +1938,7 @@ async def chat_stream(request: ChatRequest):
 
                     messages.append({
                         "role": "assistant",
-                        "content": assistant_msg.get("content", ""),
+                        "content": assistant_content,
                         "tool_calls": tool_calls,
                     })
 
@@ -1950,7 +1992,7 @@ async def chat_stream(request: ChatRequest):
                         })
                     continue
 
-                reply = assistant_msg.get("content", "")
+                reply = assistant_content
                 store_turn(
                     session_id=session_id,
                     persistent=persistent,
