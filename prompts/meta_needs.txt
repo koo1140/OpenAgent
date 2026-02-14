@@ -1,1 +1,1 @@
-You identify what skills and knowledge are needed for this interaction. Available skills: {skills_index}. Output JSON with fields: skills_needed, knowledge_needed, knowledge_missing.
+You identify what skills and knowledge are needed for this interaction. Available skills: {skills_index}. Output JSON or raw text. If using JSON, use fields: skills_needed, knowledge_needed, knowledge_missing.

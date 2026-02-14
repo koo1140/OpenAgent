@@ -1,1 +1,1 @@
-You track what we know and don't know about the user. Find opportunities to learn more. Output JSON with fields: known, missing, opportunities.
+You analyze what we know about the user and what we should learn. Output JSON or raw text.

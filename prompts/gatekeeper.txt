@@ -12,7 +12,7 @@ Rules:
 - Never save summaries of everything
 - Be precise
 
-Output JSON:
+You can output your results as raw text or structured JSON. If using JSON, follow this format:
 {
     "save_memory": false,
     "memory": {"content": "", "category": "", "tags": []},
