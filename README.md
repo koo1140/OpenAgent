@@ -11,6 +11,11 @@ This system implements dual architecture modes:
 - `legacy` (existing five-layer pipeline)
 - `hierarchical_v2` (Main -> Summarizer optional -> Orchestrator -> Sub-Agent strict syntax)
 
+`hierarchical_v2` includes loop guards:
+- Terminal tool outcomes (`rejected`, `denied`, `unknown_tool`) stop repeated retries.
+- Repeated failing actions are auto-finished with partial results and warnings.
+- Main finalizes directly after orchestrator completion to avoid recursive orchestrator calls.
+
 The legacy mode uses a sophisticated five-layer architecture:
 
 1. **Layer 1: Meta-Analysis** - Observational consciousness analyzing intent, tone, and patterns across 6 dimensions.

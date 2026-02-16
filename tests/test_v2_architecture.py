@@ -5,11 +5,18 @@ import pytest
 
 from main import (
     AgentConfig,
+    ChatRequest,
     ProviderConfig,
+    execute_v2_tool,
     parse_agent_action,
     parse_subagent_tag,
     parse_tool_tag,
     resolve_agent_config,
+    run_v2_orchestrator,
+    run_v2_pipeline,
+    run_v2_subagent,
+    should_allow_memory_write,
+    user_requested_memory_write,
 )
 
 
@@ -98,3 +105,160 @@ def test_v2_source_prompts_integrity_hashes():
     }
     for path, hash_value in expected.items():
         assert _sha256(path) == hash_value
+
+
+def test_memory_write_explicit_request_allows_short_content():
+    assert user_requested_memory_write("please remember this")
+    assert should_allow_memory_write({"content": "short"}, explicit_request=True)
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_explicit_short_memory_succeeds(monkeypatch):
+    async def fake_execute_tool(name, arguments):
+        return "Memory saved (id: 1)"
+
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+    outcome = await execute_v2_tool(
+        "memory_create",
+        {"content": "short"},
+        user_message="remember this",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "ok"
+    assert outcome["terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_implicit_low_value_memory_rejected():
+    outcome = await execute_v2_tool(
+        "memory_create",
+        {"content": "tiny"},
+        user_message="hi",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "rejected"
+    assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_shell_denied_terminal():
+    outcome = await execute_v2_tool(
+        "shell_command",
+        {"command": "dir"},
+        user_message="just help me",
+        allow_shell=False,
+    )
+    assert outcome["status"] in {"rejected", "denied"}
+    assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_unknown_tool_classified(monkeypatch):
+    async def fake_execute_tool(name, arguments):
+        return "Unknown tool: mystery"
+
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+    outcome = await execute_v2_tool(
+        "memory_search",
+        {"query": "x"},
+        user_message="x",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "unknown_tool"
+    assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_loop_guard_repeated_failure(monkeypatch):
+    responses = [
+        {"choices": [{"message": {"content": '[TOOL]memory_search(query="abc")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]memory_search(query="abc")[/TOOL]'}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return responses.pop(0)
+
+    async def fake_execute_tool(name, arguments):
+        return "Tool execution error: boom"
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+
+    result = await run_v2_orchestrator(
+        tasks="1. Search memory",
+        context="",
+        user_message="do it",
+        allow_shell=False,
+    )
+    assert "auto-finish" in result["result"].lower()
+    assert any("loop guard" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_subagent_loop_guard_repeated_failure(monkeypatch):
+    responses = [
+        {"choices": [{"message": {"content": '[TOOL]memory_search(query="abc")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]memory_search(query="abc")[/TOOL]'}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return responses.pop(0)
+
+    async def fake_execute_tool(name, arguments):
+        return "Tool execution error: boom"
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+
+    result = await run_v2_subagent(
+        task="search memory",
+        tools=["memory_search"],
+        context="",
+        user_message="do it",
+        allow_shell=False,
+    )
+    assert "auto-finish" in result["result"].lower()
+    assert any("loop guard" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_subagent_invalid_tool_list_auto_finishes():
+    result = await run_v2_subagent(
+        task="invalid tools",
+        tools=["not_a_real_tool"],
+        context="",
+        user_message="do it",
+        allow_shell=False,
+    )
+    assert "no valid tools" in result["result"].lower()
+    assert any("no valid tools" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_main_forces_finalization_after_orchestrator(monkeypatch):
+    from main import create_temp_session, ensure_session_policy
+
+    session = create_temp_session("v2-finalization")
+    ensure_session_policy(session["id"])
+
+    main_responses = [
+        {"choices": [{"message": {"content": '[TOOL]orchestrator(tasks="1. do thing", context="")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]summarizer(query="extra")[/TOOL]'}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return main_responses.pop(0)
+
+    async def fake_orchestrator(**kwargs):
+        return {"result": "orchestrator done", "tool_events": [], "subagent_outputs": [], "warnings": []}
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    monkeypatch.setattr("main.run_v2_orchestrator", fake_orchestrator)
+
+    result = await run_v2_pipeline(
+        request=ChatRequest(message="please do this"),
+        session_id=session["id"],
+        persistent=False,
+    )
+    assert result["reply"] == "orchestrator done"
+    assert any("bypassed" in w.lower() for w in result["meta"].get("warnings", []))

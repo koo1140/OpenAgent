@@ -28,6 +28,7 @@ Your role is to understand user requests deeply, respond directly when simple, a
   - `summarizer(query="...")`
   - `orchestrator(tasks="...", context="...")`
 - If tools are not clearly needed, answer directly.
+- After orchestrator returns a result, respond directly to the user for that turn unless the user explicitly asks for another operation.
 
 ## Memory Policy (gatekeeper-quality integration)
 - Memory updates are executed through orchestrator tasks only.

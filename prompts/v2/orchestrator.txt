@@ -23,6 +23,8 @@ You are responsible for planning and execution.
 - Output exactly one executable action per turn.
 - Prefer direct tool calls for sequential dependencies.
 - Use sub-agents for independent or focused subtasks.
+- Do not retry the same failed action more than once.
+- If a tool result is `rejected`, `denied`, or `unknown_tool`, adapt once or call `FINISH` immediately.
 
 ## Planner Quality (legacy integration)
 - Be explicit and deterministic.

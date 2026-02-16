@@ -40,6 +40,7 @@ python main.py
 ### Architecture Mode
 - `legacy` keeps the original meta/planner pipeline
 - `hierarchical_v2` enables Main + Summarizer + Orchestrator + Sub-Agent strict `[TOOL]` syntax flow
+- `hierarchical_v2` now includes loop guards to auto-stop repeated failing actions
 
 4. Click **Save Configuration**
 5. Click **Chat** and start chatting!
@@ -165,6 +166,9 @@ Have a few conversations, then say:
 
 **Tool execution fails**
 → Check file paths and permissions
+
+**hierarchical_v2 seems stuck**
+→ Check tool result warnings in Details; repeated failing actions are auto-finished and surfaced there
 
 **Tool approval required**
 → Approve once, always allow for the session, or deny and ask for manual steps

@@ -1767,9 +1767,9 @@ async def run_subagents(subagents_spec: List[Dict[str, Any]], **kwargs) -> List[
 # V2 STRICT-SYNTAX ARCHITECTURE
 # =============================================================================
 
-V2_MAX_MAIN_ROUNDS = 6
-V2_MAX_ORCHESTRATOR_ROUNDS = 16
-V2_MAX_SUBAGENT_ROUNDS = 10
+V2_MAX_MAIN_ROUNDS = 4
+V2_MAX_ORCHESTRATOR_ROUNDS = 10
+V2_MAX_SUBAGENT_ROUNDS = 6
 
 
 def load_v2_prompt(path: str, default: str) -> str:
@@ -1891,6 +1891,61 @@ def parse_tools_csv(tools_text: str) -> List[str]:
     return [part.strip() for part in raw.split() if part.strip()]
 
 
+def v2_known_tool_names() -> List[str]:
+    # In v2, sub-agent spawning is explicit via [SUBAGENT], not a callable tool.
+    return [tool["function"]["name"] for tool in TOOLS_SPEC if tool["function"]["name"] != "spawn_subagents"]
+
+
+def sanitize_subagent_tools(tools: List[str]) -> List[str]:
+    allowed = set(v2_known_tool_names())
+    seen = set()
+    result: List[str] = []
+    for tool_name in tools or []:
+        normalized = (tool_name or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        if normalized in allowed:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def user_requested_memory_write(user_message: str) -> bool:
+    if not user_message:
+        return False
+    lower = user_message.lower()
+    keywords = [
+        "remember",
+        "save this",
+        "store this",
+        "store that",
+        "keep this",
+        "keep that",
+        "don't forget",
+        "do not forget",
+        "note this",
+        "memorize",
+    ]
+    return any(keyword in lower for keyword in keywords)
+
+
+def normalize_action_signature(action_type: str, action_name: str, payload: Dict[str, Any]) -> str:
+    try:
+        payload_json = json.dumps(payload or {}, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        payload_json = str(payload)
+    return f"{action_type}:{action_name}:{payload_json}"
+
+
+def tool_outcome(status: str, message: str, terminal: bool, retryable: bool) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "message": message,
+        "terminal": terminal,
+        "retryable": retryable,
+    }
+
+
 def looks_like_action_markup(text: str) -> bool:
     if not isinstance(text, str):
         return False
@@ -1999,8 +2054,13 @@ async def parse_agent_action(
     }
 
 
-def should_allow_memory_write(arguments: Dict[str, Any]) -> bool:
+def should_allow_memory_write(arguments: Dict[str, Any], explicit_request: bool = False) -> bool:
     content = (arguments.get("content") or "").strip()
+    if not content:
+        return False
+    if explicit_request:
+        # Explicit user intent should allow short reminders.
+        return True
     if len(content) < 24:
         return False
     lowered = content.lower()
@@ -2022,20 +2082,41 @@ async def execute_v2_tool(
     arguments: Dict[str, Any],
     user_message: str,
     allow_shell: bool,
-) -> Tuple[str, str]:
+) -> Dict[str, Any]:
     if name == "FINISH":
-        return "FINISH intercepted.", "ok"
+        return tool_outcome("ok", "FINISH intercepted.", terminal=False, retryable=False)
 
     if name == "shell_command" and not should_allow_shell(arguments.get("command", ""), user_message):
-        return "Tool rejected: not necessary. Respond directly without shell.", "rejected"
+        return tool_outcome(
+            "rejected",
+            "Tool rejected: not necessary. Respond directly without shell.",
+            terminal=True,
+            retryable=False,
+        )
     if name == "shell_command" and not allow_shell:
-        return "DENIED: shell_command is not allowed for this session.", "denied"
-    if name == "memory_create" and not should_allow_memory_write(arguments):
-        return "Memory write rejected: content appears low-value or too vague.", "rejected"
+        return tool_outcome(
+            "denied",
+            "DENIED: shell_command is not allowed for this session.",
+            terminal=True,
+            retryable=False,
+        )
+    if name == "memory_create" and not should_allow_memory_write(
+        arguments,
+        explicit_request=user_requested_memory_write(user_message),
+    ):
+        return tool_outcome(
+            "rejected",
+            "Memory write rejected: content appears low-value or too vague.",
+            terminal=True,
+            retryable=False,
+        )
 
     result = await execute_tool(name, arguments)
-    status = "error" if result.startswith("Tool execution error") else "ok"
-    return result, status
+    if result.startswith("Unknown tool:"):
+        return tool_outcome("unknown_tool", result, terminal=True, retryable=False)
+    if result.startswith("Tool execution error"):
+        return tool_outcome("error", result, terminal=False, retryable=True)
+    return tool_outcome("ok", result, terminal=False, retryable=False)
 
 
 def build_transcript(turns: List[Dict[str, Any]], current_user_message: str) -> str:
@@ -2078,7 +2159,18 @@ async def run_v2_subagent(
         "sub_agent.txt",
         "You are a Sub-Agent. Use allowed tools and finish with [TOOL]FINISH(result=\"...\")[/TOOL]."
     )
-    allowed_tools = sorted(set(tools))
+    warnings: List[str] = []
+    allowed_tools = sanitize_subagent_tools(tools)
+    if not allowed_tools:
+        result_text = "Sub-agent auto-finish: no valid tools were provided for this task."
+        return {
+            "role": "subagent",
+            "task": task,
+            "result": result_text,
+            "output": result_text,
+            "tool_events": [],
+            "warnings": ["no valid tools after sanitization"],
+        }
     if "FINISH" not in allowed_tools:
         allowed_tools.append("FINISH")
 
@@ -2096,6 +2188,8 @@ async def run_v2_subagent(
     ]
     tool_events: List[Dict[str, Any]] = []
     partial_notes: List[str] = []
+    action_attempts: Dict[str, int] = {}
+    action_failures: Dict[str, int] = {}
 
     for _ in range(V2_MAX_SUBAGENT_ROUNDS):
         response = await LLMProvider.call(config.sub, messages, **kwargs)
@@ -2137,28 +2231,74 @@ async def run_v2_subagent(
                     "result": result_text,
                     "output": result_text,
                     "tool_events": tool_events,
-                    "warnings": [],
+                    "warnings": warnings,
                 }
 
             if queue_event:
                 await queue_event("tool_call", {"name": tool_name, "args": args})
-            result, status = await execute_v2_tool(
+            outcome = await execute_v2_tool(
                 tool_name,
                 args,
                 user_message=user_message,
                 allow_shell=allow_shell,
             )
+            result = outcome["message"]
+            status = outcome["status"]
+            terminal = bool(outcome.get("terminal"))
+            signature = normalize_action_signature("tool", tool_name, args)
+            action_attempts[signature] = action_attempts.get(signature, 0) + 1
+            if status != "ok":
+                action_failures[signature] = action_failures.get(signature, 0) + 1
+
+            event_status = status
+            if terminal and status in {"rejected", "denied"}:
+                event_status = f"terminal_{status}"
+
             if queue_event:
-                await queue_event("tool_result", {"name": tool_name, "status": status, "result": truncate(result)})
+                await queue_event("tool_result", {"name": tool_name, "status": event_status, "result": truncate(result)})
             tool_events.append({
                 "name": tool_name,
                 "args": args,
-                "status": status,
+                "status": event_status,
                 "result": truncate(result),
             })
-            partial_notes.append(f"{tool_name}:{status}")
+            partial_notes.append(f"{tool_name}:{event_status}")
             messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
-            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {status}):\n{result}"})
+            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {event_status}):\n{result}"})
+
+            if terminal:
+                warnings.append(f"terminal failure on '{tool_name}' ({status})")
+                auto_finish = (
+                    f"Sub-agent auto-finish: terminal failure on '{tool_name}' ({status}). "
+                    "Returning partial progress."
+                )
+                if partial_notes:
+                    auto_finish += f" Notes: {' | '.join(partial_notes)}"
+                return {
+                    "role": "subagent",
+                    "task": task,
+                    "result": auto_finish,
+                    "output": auto_finish,
+                    "tool_events": tool_events,
+                    "warnings": warnings,
+                }
+
+            if action_failures.get(signature, 0) >= 2:
+                warnings.append(f"loop guard triggered for repeated failing action '{tool_name}'")
+                auto_finish = (
+                    f"Sub-agent auto-finish: repeated failure on '{tool_name}'. "
+                    "Returning partial progress."
+                )
+                if partial_notes:
+                    auto_finish += f" Notes: {' | '.join(partial_notes)}"
+                return {
+                    "role": "subagent",
+                    "task": task,
+                    "result": auto_finish,
+                    "output": auto_finish,
+                    "tool_events": tool_events,
+                    "warnings": warnings,
+                }
             continue
 
     timeout_result = "Sub-agent auto-finish: max rounds reached without FINISH."
@@ -2168,7 +2308,7 @@ async def run_v2_subagent(
         "result": timeout_result,
         "output": timeout_result,
         "tool_events": tool_events,
-        "warnings": ["max rounds reached"],
+        "warnings": warnings + ["max rounds reached"],
     }
 
 
@@ -2184,7 +2324,7 @@ async def run_v2_orchestrator(
         "orchestrator.txt",
         "You are Orchestrator Agent. Execute one action per turn and finish with FINISH."
     )
-    allowed_tool_names = [tool["function"]["name"] for tool in TOOLS_SPEC] + ["FINISH"]
+    allowed_tool_names = v2_known_tool_names() + ["FINISH"]
 
     messages = [
         {"role": "system", "content": f"{prompt}\n\nSyntax is case-sensitive."},
@@ -2194,6 +2334,8 @@ async def run_v2_orchestrator(
     tool_events: List[Dict[str, Any]] = []
     subagent_outputs: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    action_attempts: Dict[str, int] = {}
+    action_failures: Dict[str, int] = {}
 
     for _ in range(V2_MAX_ORCHESTRATOR_ROUNDS):
         response = await LLMProvider.call(get_orchestrator_cfg(), messages, **kwargs)
@@ -2227,7 +2369,34 @@ async def run_v2_orchestrator(
 
         if parsed["type"] == "subagent":
             sub_task = parsed.get("task", "")
-            sub_tools = parsed.get("tools", [])
+            sub_tools = sanitize_subagent_tools(parsed.get("tools", []))
+            sub_signature = normalize_action_signature("subagent", sub_task, {"tools": sub_tools, "context": context})
+            action_attempts[sub_signature] = action_attempts.get(sub_signature, 0) + 1
+            if not sub_tools:
+                action_failures[sub_signature] = action_failures.get(sub_signature, 0) + 1
+                warnings.append("subagent request had no valid tools; auto-finished that branch")
+                sub_result = {
+                    "role": "subagent",
+                    "task": sub_task,
+                    "result": "Sub-agent auto-finish: no valid tools after sanitization.",
+                    "output": "Sub-agent auto-finish: no valid tools after sanitization.",
+                    "tool_events": [],
+                    "warnings": ["no valid tools after sanitization"],
+                }
+                subagent_outputs.append(sub_result)
+                if queue_event:
+                    await queue_event("subagent", sub_result)
+                messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
+                messages.append({"role": "system", "content": f"Sub-agent result:\n{sub_result.get('result', '')}"})
+                if action_failures.get(sub_signature, 0) >= 2:
+                    warnings.append("loop guard triggered for repeated failing sub-agent action")
+                    return {
+                        "result": "Orchestrator auto-finish: repeated failing sub-agent action.",
+                        "tool_events": tool_events,
+                        "subagent_outputs": subagent_outputs,
+                        "warnings": warnings,
+                    }
+                continue
             if queue_event:
                 await queue_event("stage", {"name": "subagent"})
             sub_result = await run_v2_subagent(
@@ -2242,6 +2411,16 @@ async def run_v2_orchestrator(
             subagent_outputs.append(sub_result)
             if queue_event:
                 await queue_event("subagent", sub_result)
+            if sub_result.get("warnings"):
+                action_failures[sub_signature] = action_failures.get(sub_signature, 0) + 1
+            if action_failures.get(sub_signature, 0) >= 2:
+                warnings.append("loop guard triggered for repeated failing sub-agent action")
+                return {
+                    "result": "Orchestrator auto-finish: repeated failing sub-agent action.",
+                    "tool_events": tool_events,
+                    "subagent_outputs": subagent_outputs,
+                    "warnings": warnings,
+                }
             messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
             messages.append({"role": "system", "content": f"Sub-agent result:\n{sub_result.get('result', '')}"})
             continue
@@ -2260,24 +2439,60 @@ async def run_v2_orchestrator(
 
             if queue_event:
                 await queue_event("tool_call", {"name": tool_name, "args": args})
-            result, status = await execute_v2_tool(
+            outcome = await execute_v2_tool(
                 tool_name,
                 args,
                 user_message=user_message,
                 allow_shell=allow_shell,
             )
+            result = outcome["message"]
+            status = outcome["status"]
+            terminal = bool(outcome.get("terminal"))
+            signature = normalize_action_signature("tool", tool_name, args)
+            action_attempts[signature] = action_attempts.get(signature, 0) + 1
+            if status != "ok":
+                action_failures[signature] = action_failures.get(signature, 0) + 1
+
+            event_status = status
+            if terminal and status in {"rejected", "denied"}:
+                event_status = f"terminal_{status}"
+
             if queue_event:
-                await queue_event("tool_result", {"name": tool_name, "status": status, "result": truncate(result)})
+                await queue_event("tool_result", {"name": tool_name, "status": event_status, "result": truncate(result)})
             tool_events.append({
                 "id": None,
                 "name": tool_name,
                 "args": args,
-                "status": status,
+                "status": event_status,
                 "result": result,
                 "created_at": now_iso(),
             })
             messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
-            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {status}):\n{result}"})
+            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {event_status}):\n{result}"})
+
+            if terminal:
+                warnings.append(f"terminal failure on '{tool_name}' ({status})")
+                return {
+                    "result": (
+                        f"Orchestrator auto-finish: terminal failure on '{tool_name}' ({status}). "
+                        "Returning partial results."
+                    ),
+                    "tool_events": tool_events,
+                    "subagent_outputs": subagent_outputs,
+                    "warnings": warnings,
+                }
+
+            if action_failures.get(signature, 0) >= 2:
+                warnings.append(f"loop guard triggered for repeated failing action '{tool_name}'")
+                return {
+                    "result": (
+                        f"Orchestrator auto-finish: repeated failure on '{tool_name}'. "
+                        "Returning partial results."
+                    ),
+                    "tool_events": tool_events,
+                    "subagent_outputs": subagent_outputs,
+                    "warnings": warnings,
+                }
             continue
 
     timeout_finish = "Orchestrator auto-finish: max rounds reached without FINISH."
@@ -2332,6 +2547,8 @@ async def run_v2_pipeline(
     summaries: List[Dict[str, Any]] = []
     orchestrator_result = ""
     warnings: List[str] = []
+    orchestrator_invoked = False
+    force_direct_finalization = False
 
     for _ in range(V2_MAX_MAIN_ROUNDS):
         response = await LLMProvider.call(config.main, messages, **kwargs)
@@ -2347,11 +2564,15 @@ async def run_v2_pipeline(
         )
 
         if parsed["type"] == "invalid":
-            safe_reply = (
-                "I hit an internal action-format issue while processing your request. "
-                "I can still help directly if you want me to continue step by step."
-            )
-            warnings.append(parsed.get("reason", "invalid action"))
+            if force_direct_finalization and orchestrator_result:
+                safe_reply = orchestrator_result
+                warnings.append("main produced invalid action during finalization; using orchestrator result directly")
+            else:
+                safe_reply = (
+                    "I hit an internal action-format issue while processing your request. "
+                    "I can still help directly if you want me to continue step by step."
+                )
+                warnings.append(parsed.get("reason", "invalid action"))
             meta = {
                 "architecture_mode": "hierarchical_v2",
                 "warnings": warnings,
@@ -2420,6 +2641,47 @@ async def run_v2_pipeline(
                 "architecture_mode": "hierarchical_v2",
             }
 
+        if force_direct_finalization and parsed["type"] == "tool":
+            warnings.append("main attempted extra tool call after orchestrator completion; bypassed")
+            reply = orchestrator_result or "I completed the orchestration and here is the result."
+            meta = {
+                "architecture_mode": "hierarchical_v2",
+                "warnings": warnings,
+                "summaries": summaries,
+                "orchestrator_result": orchestrator_result,
+            }
+            store_turn(
+                session_id=session_id,
+                persistent=persistent,
+                user_message=request.message,
+                assistant_reply=reply,
+                meta_json=meta,
+                tool_events=tool_events,
+                subagent_outputs=subagent_outputs,
+                architecture_mode="hierarchical_v2",
+            )
+            if queue_event:
+                await queue_event("stage", {"name": "finish"})
+            return {
+                "reply": reply,
+                "meta": meta,
+                "tool_events": [
+                    {
+                        "id": ev.get("id"),
+                        "name": ev["name"],
+                        "args": ev["args"],
+                        "status": ev["status"],
+                        "result": truncate(ev["result"]),
+                        "created_at": ev["created_at"],
+                    }
+                    for ev in tool_events
+                ],
+                "subagent_outputs": subagent_outputs,
+                "status": "ok",
+                "session_id": session_id,
+                "architecture_mode": "hierarchical_v2",
+            }
+
         if parsed["type"] == "tool":
             tool_name = parsed["tool_name"]
             params = parsed["params"]
@@ -2435,6 +2697,47 @@ async def run_v2_pipeline(
                 continue
 
             if tool_name == "orchestrator":
+                if orchestrator_invoked:
+                    warnings.append("orchestrator was already invoked once; forcing final response")
+                    reply = orchestrator_result or "I have already completed the orchestration for this request."
+                    meta = {
+                        "architecture_mode": "hierarchical_v2",
+                        "warnings": warnings,
+                        "summaries": summaries,
+                        "orchestrator_result": orchestrator_result,
+                    }
+                    store_turn(
+                        session_id=session_id,
+                        persistent=persistent,
+                        user_message=request.message,
+                        assistant_reply=reply,
+                        meta_json=meta,
+                        tool_events=tool_events,
+                        subagent_outputs=subagent_outputs,
+                        architecture_mode="hierarchical_v2",
+                    )
+                    if queue_event:
+                        await queue_event("stage", {"name": "finish"})
+                    return {
+                        "reply": reply,
+                        "meta": meta,
+                        "tool_events": [
+                            {
+                                "id": ev.get("id"),
+                                "name": ev["name"],
+                                "args": ev["args"],
+                                "status": ev["status"],
+                                "result": truncate(ev["result"]),
+                                "created_at": ev["created_at"],
+                            }
+                            for ev in tool_events
+                        ],
+                        "subagent_outputs": subagent_outputs,
+                        "status": "ok",
+                        "session_id": session_id,
+                        "architecture_mode": "hierarchical_v2",
+                    }
+
                 if queue_event:
                     await queue_event("stage", {"name": "orchestrator"})
                 tasks = params.get("tasks", "")
@@ -2452,6 +2755,15 @@ async def run_v2_pipeline(
                 subagent_outputs.extend(orchestrator_output.get("subagent_outputs", []))
                 warnings.extend(orchestrator_output.get("warnings", []))
                 messages.append({"role": "system", "content": f"Orchestrator result:\n{orchestrator_result}"})
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Orchestrator has completed. Produce a direct user-facing reply now. "
+                        "Do not call any more tools for this turn."
+                    ),
+                })
+                orchestrator_invoked = True
+                force_direct_finalization = True
                 continue
 
     fallback_reply = orchestrator_result or "I completed internal processing but could not finalize a stable response."
