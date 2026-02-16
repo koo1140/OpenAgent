@@ -171,7 +171,7 @@ Have a few conversations, then say:
 → Check tool result warnings in Details; repeated failing actions are auto-finished and surfaced there
 
 **Tool approval required**
-→ Approve once, always allow for the session, or deny and ask for manual steps
+→ Approve once or deny and ask for manual steps (`allow_session` is treated as run-once)
 
 **Meta agent not analyzing well**
 → Try a smarter model (but it will be slower/costlier)

@@ -7,16 +7,16 @@ from main import (
     AgentConfig,
     ChatRequest,
     ProviderConfig,
+    TOOLS_SPEC,
     execute_v2_tool,
     parse_agent_action,
     parse_subagent_tag,
     parse_tool_tag,
     resolve_agent_config,
+    run_tool_loop,
     run_v2_orchestrator,
     run_v2_pipeline,
     run_v2_subagent,
-    should_allow_memory_write,
-    user_requested_memory_write,
 )
 
 
@@ -107,11 +107,6 @@ def test_v2_source_prompts_integrity_hashes():
         assert _sha256(path) == hash_value
 
 
-def test_memory_write_explicit_request_allows_short_content():
-    assert user_requested_memory_write("please remember this")
-    assert should_allow_memory_write({"content": "short"}, explicit_request=True)
-
-
 @pytest.mark.asyncio
 async def test_execute_v2_tool_explicit_short_memory_succeeds(monkeypatch):
     async def fake_execute_tool(name, arguments):
@@ -129,15 +124,19 @@ async def test_execute_v2_tool_explicit_short_memory_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_v2_tool_implicit_low_value_memory_rejected():
+async def test_execute_v2_tool_memory_write_not_semantically_rejected(monkeypatch):
+    async def fake_execute_tool(name, arguments):
+        return "Memory saved (id: 2)"
+
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
     outcome = await execute_v2_tool(
         "memory_create",
         {"content": "tiny"},
         user_message="hi",
         allow_shell=False,
     )
-    assert outcome["status"] == "rejected"
-    assert outcome["terminal"] is True
+    assert outcome["status"] == "ok"
+    assert outcome["terminal"] is False
 
 
 @pytest.mark.asyncio
@@ -147,9 +146,24 @@ async def test_execute_v2_tool_shell_denied_terminal():
         {"command": "dir"},
         user_message="just help me",
         allow_shell=False,
+        approval_mode="auto_deny",
     )
-    assert outcome["status"] in {"rejected", "denied"}
+    assert outcome["status"] == "denied"
     assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_shell_needs_approval_in_ask_mode():
+    outcome = await execute_v2_tool(
+        "shell_command",
+        {"command": "dir"},
+        user_message="run it",
+        allow_shell=False,
+        approval_mode="ask",
+    )
+    assert outcome["status"] == "needs_approval"
+    assert outcome["terminal"] is False
+    assert outcome.get("pending_tools")
 
 
 @pytest.mark.asyncio
@@ -166,6 +180,47 @@ async def test_execute_v2_tool_unknown_tool_classified(monkeypatch):
     )
     assert outcome["status"] == "unknown_tool"
     assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_shell_approval_pause_and_resume(monkeypatch):
+    responses = [
+        {"choices": [{"message": {"content": '[TOOL]shell_command(command="echo hi")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]FINISH(result="done")[/TOOL]'}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return responses.pop(0)
+
+    async def fake_execute_tool(name, arguments):
+        assert name == "shell_command"
+        return "STDOUT:\nhi\nSTDERR:\n"
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+
+    first = await run_v2_orchestrator(
+        tasks="1. run shell",
+        context="",
+        user_message="do it",
+        allow_shell=False,
+        approval_mode="ask",
+    )
+    assert first["status"] == "needs_approval"
+    assert first.get("pending_tools")
+
+    resumed = await run_v2_orchestrator(
+        tasks="",
+        context="",
+        user_message="do it",
+        allow_shell=False,
+        state=first["state"],
+        shell_approval=True,
+        approval_mode="ask",
+    )
+    assert resumed["status"] == "ok"
+    assert resumed["result"] == "done"
+    assert resumed["tool_events"]
 
 
 @pytest.mark.asyncio
@@ -192,6 +247,40 @@ async def test_orchestrator_loop_guard_repeated_failure(monkeypatch):
     )
     assert "auto-finish" in result["result"].lower()
     assert any("loop guard" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_legacy_tool_loop_shell_always_needs_approval(monkeypatch):
+    cfg = ProviderConfig(provider="OpenAI", model="x", api_key="k")
+    messages = [{"role": "user", "content": "Do this"}]
+
+    async def fake_call(*args, **kwargs):
+        return {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "shell_command", "arguments": "{\"command\":\"echo hi\"}"},
+                        }
+                    ],
+                }
+            }]
+        }
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    result = await run_tool_loop(
+        cfg,
+        messages,
+        TOOLS_SPEC,
+        approval_mode="ask",
+        allow_shell=False,
+        user_message="hello",
+    )
+    assert result["status"] == "needs_approval"
+    assert result["pending_tool_calls"]
 
 
 @pytest.mark.asyncio
@@ -262,3 +351,46 @@ async def test_main_forces_finalization_after_orchestrator(monkeypatch):
     )
     assert result["reply"] == "orchestrator done"
     assert any("bypassed" in w.lower() for w in result["meta"].get("warnings", []))
+
+
+@pytest.mark.asyncio
+async def test_v2_pipeline_shell_pause_and_resume(monkeypatch):
+    from main import create_temp_session, ensure_session_policy
+
+    session = create_temp_session("v2-approval-resume")
+    ensure_session_policy(session["id"])
+
+    responses = [
+        {"choices": [{"message": {"content": '[TOOL]orchestrator(tasks="1. run shell", context="")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]shell_command(command="echo hi")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]FINISH(result="orchestrator done")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": "Final user reply"}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return responses.pop(0)
+
+    async def fake_execute_tool(name, arguments):
+        return "STDOUT:\nhi\nSTDERR:\n"
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+
+    first = await run_v2_pipeline(
+        request=ChatRequest(message="please run shell"),
+        session_id=session["id"],
+        persistent=False,
+    )
+    assert first["status"] == "needs_approval"
+    assert first.get("v2_resume_state")
+    assert first.get("pending_tools")
+
+    resumed = await run_v2_pipeline(
+        request=ChatRequest(message="please run shell"),
+        session_id=session["id"],
+        persistent=False,
+        state=first["v2_resume_state"],
+        shell_approval=True,
+    )
+    assert resumed["status"] == "ok"
+    assert resumed["reply"] == "Final user reply"

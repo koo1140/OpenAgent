@@ -69,7 +69,7 @@ Built-in tools for real work:
 
 ### 🔒 Tool Approval
 - Shell commands require explicit approval
-- Approve once, always allow for session, or deny
+- Approve once or deny (`allow_session` is accepted for compatibility and treated as run-once)
 - Tool output is truncated in UI with on-demand full view
 
 ### ⏳ Resilient Execution
@@ -520,6 +520,7 @@ Approve shell_command tool calls.
   "decision": "run_once | allow_session | deny"
 }
 ```
+`allow_session` is backward-compatible and behaves like `run_once`.
 
 ## Provider Configuration
 
