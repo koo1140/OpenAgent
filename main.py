@@ -11,6 +11,7 @@ import asyncio
 import httpx
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -156,9 +157,12 @@ class ProviderConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    meta: ProviderConfig
+    architecture_mode: Literal["legacy", "hierarchical_v2"] = "legacy"
+    meta: Optional[ProviderConfig] = None
     main: ProviderConfig
     sub: ProviderConfig
+    orchestrator: Optional[ProviderConfig] = None
+    summarizer: Optional[ProviderConfig] = None
 
 
 class ChatMessage(BaseModel):
@@ -207,6 +211,7 @@ class ChatResponse(BaseModel):
     status: str = "ok"
     pending_tools: Optional[List[Dict[str, Any]]] = None
     session_id: Optional[str] = None
+    architecture_mode: Literal["legacy", "hierarchical_v2"] = "legacy"
 
 
 class SessionCreateRequest(BaseModel):
@@ -278,6 +283,7 @@ def init_db() -> None:
             meta_json TEXT,
             tool_json TEXT,
             subagent_json TEXT,
+            architecture_mode TEXT,
             created_at TEXT,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )
@@ -303,6 +309,10 @@ def init_db() -> None:
     # Migration: Add working_memory to sessions if it doesn't exist
     try:
         cur.execute("ALTER TABLE sessions ADD COLUMN working_memory TEXT")
+    except sqlite3.OperationalError:
+        pass # Already exists
+    try:
+        cur.execute("ALTER TABLE turns ADD COLUMN architecture_mode TEXT")
     except sqlite3.OperationalError:
         pass # Already exists
 
@@ -331,10 +341,29 @@ def resolve_provider_config(cfg: ProviderConfig) -> ProviderConfig:
 
 
 def resolve_agent_config(agent_cfg: AgentConfig) -> AgentConfig:
+    resolved_meta = resolve_provider_config(agent_cfg.meta) if agent_cfg.meta else None
+    resolved_main = resolve_provider_config(agent_cfg.main)
+    resolved_sub = resolve_provider_config(agent_cfg.sub)
+    resolved_orchestrator = resolve_provider_config(agent_cfg.orchestrator) if agent_cfg.orchestrator else None
+    resolved_summarizer = resolve_provider_config(agent_cfg.summarizer) if agent_cfg.summarizer else None
+
+    # Backward-compatible defaults:
+    # - legacy mode relies on meta/main/sub
+    # - hierarchical_v2 can fall back to existing fields if not explicitly set
+    if resolved_meta is None:
+        resolved_meta = resolved_orchestrator or resolved_main
+    if resolved_orchestrator is None:
+        resolved_orchestrator = resolved_meta or resolved_main
+    if resolved_summarizer is None:
+        resolved_summarizer = resolved_meta or resolved_main
+
     return AgentConfig(
-        meta=resolve_provider_config(agent_cfg.meta),
-        main=resolve_provider_config(agent_cfg.main),
-        sub=resolve_provider_config(agent_cfg.sub),
+        architecture_mode=agent_cfg.architecture_mode,
+        meta=resolved_meta,
+        main=resolved_main,
+        sub=resolved_sub,
+        orchestrator=resolved_orchestrator,
+        summarizer=resolved_summarizer,
     )
 
 
@@ -355,6 +384,24 @@ if config:
     print("✅ Loaded agent config from config.json")
 else:
     print("⚠ No config.json found, you need to POST /api/config at least once")
+
+
+def get_architecture_mode() -> Literal["legacy", "hierarchical_v2"]:
+    if not config:
+        return "legacy"
+    return config.architecture_mode
+
+
+def get_orchestrator_cfg() -> ProviderConfig:
+    if not config:
+        raise ValueError("Configuration not set")
+    return config.orchestrator or config.main
+
+
+def get_summarizer_cfg() -> ProviderConfig:
+    if not config:
+        raise ValueError("Configuration not set")
+    return config.summarizer or config.main
 
 
 # =============================================================================
@@ -1173,6 +1220,7 @@ def get_session_turns(session_id: str) -> List[Dict[str, Any]]:
             "meta": json.loads(row["meta_json"] or "{}"),
             "tool_events": tool_events,
             "subagent_outputs": json.loads(row["subagent_json"] or "[]"),
+            "architecture_mode": row["architecture_mode"] or "legacy",
             "created_at": row["created_at"],
         })
     conn.close()
@@ -1263,6 +1311,7 @@ def store_turn(
     meta_json: Dict[str, Any],
     tool_events: List[Dict[str, Any]],
     subagent_outputs: List[Dict[str, Any]],
+    architecture_mode: str = "legacy",
 ) -> None:
     canonical_reply = content_to_text(assistant_reply)
     if not persistent:
@@ -1282,6 +1331,7 @@ def store_turn(
                 for ev in tool_events
             ],
             "subagent_outputs": subagent_outputs,
+            "architecture_mode": architecture_mode,
             "created_at": now_iso(),
         })
         temp_sessions[session_id]["updated_at"] = now_iso()
@@ -1291,8 +1341,8 @@ def store_turn(
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO turns (session_id, user_message, assistant_reply, meta_json, tool_json, subagent_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (session_id, user_message, assistant_reply, meta_json, tool_json, subagent_json, architecture_mode, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -1301,6 +1351,7 @@ def store_turn(
             json.dumps(meta_json),
             json.dumps([]),
             json.dumps(subagent_outputs),
+            architecture_mode,
             now_iso(),
         ),
     )
@@ -1713,6 +1764,876 @@ async def run_subagents(subagents_spec: List[Dict[str, Any]], **kwargs) -> List[
 
 
 # =============================================================================
+# V2 STRICT-SYNTAX ARCHITECTURE
+# =============================================================================
+
+V2_MAX_MAIN_ROUNDS = 6
+V2_MAX_ORCHESTRATOR_ROUNDS = 16
+V2_MAX_SUBAGENT_ROUNDS = 10
+
+
+def load_v2_prompt(path: str, default: str) -> str:
+    return load_prompt(PROMPTS_DIR / "v2" / path, default)
+
+
+def unescape_tag_value(value: str) -> str:
+    try:
+        return bytes(value, "utf-8").decode("unicode_escape")
+    except Exception:
+        return value.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def parse_param_list(params_text: str) -> Optional[Dict[str, str]]:
+    text = (params_text or "").strip()
+    if not text:
+        return {}
+
+    pattern = re.compile(
+        r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(,|$)',
+        re.DOTALL,
+    )
+    pos = 0
+    params: Dict[str, str] = {}
+    while pos < len(text):
+        match = pattern.match(text, pos)
+        if not match:
+            return None
+        key = match.group(1)
+        value = unescape_tag_value(match.group(2))
+        params[key] = value
+        pos = match.end()
+        if match.group(3) == "":
+            break
+    if text[pos:].strip():
+        return None
+    return params
+
+
+def parse_attr_list(attrs_text: str) -> Optional[Dict[str, str]]:
+    text = attrs_text or ""
+    pattern = re.compile(
+        r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*',
+        re.DOTALL,
+    )
+    pos = 0
+    attrs: Dict[str, str] = {}
+    while pos < len(text):
+        match = pattern.match(text, pos)
+        if not match:
+            if text[pos:].strip():
+                return None
+            break
+        key = match.group(1)
+        value = unescape_tag_value(match.group(2))
+        attrs[key] = value
+        pos = match.end()
+    return attrs
+
+
+def parse_tool_tag(text: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    match = re.fullmatch(r"\[TOOL\](.+)\[/TOOL\]", stripped, flags=re.DOTALL)
+    if not match:
+        return None
+
+    invocation = match.group(1).strip()
+    call_match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\((.*)\)", invocation, flags=re.DOTALL)
+    if not call_match:
+        return None
+
+    tool_name = call_match.group(1)
+    params_text = call_match.group(2).strip()
+    params = parse_param_list(params_text)
+    if params is None:
+        return None
+
+    return {
+        "type": "tool",
+        "tool_name": tool_name,
+        "params": params,
+        "raw": stripped,
+    }
+
+
+def parse_subagent_tag(text: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    match = re.fullmatch(r"\[SUBAGENT\s+(.+)\]", stripped, flags=re.DOTALL)
+    if not match:
+        return None
+
+    attrs = parse_attr_list(match.group(1))
+    if attrs is None:
+        return None
+    if "task" not in attrs or "tools" not in attrs:
+        return None
+
+    return {
+        "type": "subagent",
+        "task": attrs["task"],
+        "tools": attrs["tools"],
+        "attrs": attrs,
+        "raw": stripped,
+    }
+
+
+def parse_tools_csv(tools_text: str) -> List[str]:
+    raw = (tools_text or "").strip()
+    if not raw:
+        return []
+    if raw == "*":
+        return [tool["function"]["name"] for tool in TOOLS_SPEC]
+    if "," in raw:
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return [part.strip() for part in raw.split() if part.strip()]
+
+
+def looks_like_action_markup(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    return "[TOOL" in text or "[SUBAGENT" in text
+
+
+async def repair_agent_action_output(
+    provider_cfg: ProviderConfig,
+    raw_text: str,
+    role: str,
+    allowed_tool_names: List[str],
+    allow_subagent: bool,
+    allow_direct_text: bool,
+    **kwargs
+) -> str:
+    tools_text = ", ".join(allowed_tool_names) if allowed_tool_names else "none"
+    system_prompt = (
+        "Repair the user's malformed agent action output.\n"
+        "Rules:\n"
+        "1. Output exactly one action in case-sensitive syntax, or plain text if allowed.\n"
+        "2. Valid tool syntax: [TOOL]tool_name(param=\"value\")[/TOOL]\n"
+        "3. Valid subagent syntax: [SUBAGENT task=\"...\" tools=\"...\"]\n"
+        "4. FINISH must be [TOOL]FINISH(result=\"...\")[/TOOL]\n"
+        "5. Do not explain.\n"
+        f"Role: {role}\n"
+        f"Allowed tools: {tools_text}\n"
+        f"Allow [SUBAGENT]: {'yes' if allow_subagent else 'no'}\n"
+        f"Allow direct text: {'yes' if allow_direct_text else 'no'}\n"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": raw_text},
+    ]
+    try:
+        response = await LLMProvider.call(provider_cfg, messages, **kwargs)
+        return content_to_text(response["choices"][0]["message"]["content"]).strip()
+    except Exception as exc:
+        logger.warning("Action repair failed for role %s: %s", role, exc)
+        return ""
+
+
+async def parse_agent_action(
+    role: str,
+    text: str,
+    provider_cfg: ProviderConfig,
+    allowed_tool_names: List[str],
+    allow_subagent: bool,
+    allow_direct_text: bool,
+    **kwargs
+) -> Dict[str, Any]:
+    def strict_parse(candidate: str) -> Dict[str, Any]:
+        parsed_tool = parse_tool_tag(candidate)
+        if parsed_tool:
+            tool_name = parsed_tool["tool_name"]
+            if tool_name not in allowed_tool_names:
+                return {"type": "invalid", "reason": f"Tool '{tool_name}' is not allowed", "raw": candidate}
+            return {
+                "type": "tool",
+                "tool_name": tool_name,
+                "params": parsed_tool["params"],
+                "raw": parsed_tool["raw"],
+            }
+
+        if allow_subagent:
+            parsed_sub = parse_subagent_tag(candidate)
+            if parsed_sub:
+                return {
+                    "type": "subagent",
+                    "task": parsed_sub["task"],
+                    "tools": parse_tools_csv(parsed_sub["tools"]),
+                    "attrs": parsed_sub["attrs"],
+                    "raw": parsed_sub["raw"],
+                }
+
+        if allow_direct_text and not looks_like_action_markup(candidate):
+            return {"type": "direct_text", "content": candidate.strip(), "raw": candidate}
+
+        return {"type": "invalid", "reason": "No valid action found", "raw": candidate}
+
+    first = strict_parse(text)
+    if first["type"] != "invalid":
+        first["repaired"] = False
+        return first
+
+    repaired_output = await repair_agent_action_output(
+        provider_cfg,
+        text,
+        role,
+        allowed_tool_names,
+        allow_subagent,
+        allow_direct_text,
+        **kwargs,
+    )
+    if repaired_output:
+        second = strict_parse(repaired_output)
+        if second["type"] != "invalid":
+            second["repaired"] = True
+            second["repair_source"] = text
+            return second
+
+    return {
+        "type": "invalid",
+        "reason": first.get("reason", "Invalid action"),
+        "raw": text,
+        "repaired": False,
+    }
+
+
+def should_allow_memory_write(arguments: Dict[str, Any]) -> bool:
+    content = (arguments.get("content") or "").strip()
+    if len(content) < 24:
+        return False
+    lowered = content.lower()
+    meaningful_markers = [
+        "preference",
+        "goal",
+        "constraint",
+        "deadline",
+        "name",
+        "project",
+        "workflow",
+        "habit",
+    ]
+    return any(marker in lowered for marker in meaningful_markers) or len(content) >= 80
+
+
+async def execute_v2_tool(
+    name: str,
+    arguments: Dict[str, Any],
+    user_message: str,
+    allow_shell: bool,
+) -> Tuple[str, str]:
+    if name == "FINISH":
+        return "FINISH intercepted.", "ok"
+
+    if name == "shell_command" and not should_allow_shell(arguments.get("command", ""), user_message):
+        return "Tool rejected: not necessary. Respond directly without shell.", "rejected"
+    if name == "shell_command" and not allow_shell:
+        return "DENIED: shell_command is not allowed for this session.", "denied"
+    if name == "memory_create" and not should_allow_memory_write(arguments):
+        return "Memory write rejected: content appears low-value or too vague.", "rejected"
+
+    result = await execute_tool(name, arguments)
+    status = "error" if result.startswith("Tool execution error") else "ok"
+    return result, status
+
+
+def build_transcript(turns: List[Dict[str, Any]], current_user_message: str) -> str:
+    lines: List[str] = []
+    for turn in turns:
+        lines.append(f"User: {turn.get('user_message', '')}")
+        lines.append(f"Assistant: {turn.get('assistant_reply', '')}")
+    if current_user_message:
+        lines.append(f"User: {current_user_message}")
+    return "\n".join(lines)
+
+
+async def run_v2_summarizer(query: str, transcript: str, **kwargs) -> str:
+    prompt = load_v2_prompt(
+        "summarizer.txt",
+        "You are Summarizer Agent. Return concise plain text only."
+    )
+    messages = [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": f"Query:\n{query}\n\nConversation History:\n{transcript}",
+        },
+    ]
+    response = await LLMProvider.call(get_summarizer_cfg(), messages, **kwargs)
+    summary = content_to_text(response["choices"][0]["message"]["content"]).strip()
+    return summary or "Not found in conversation."
+
+
+async def run_v2_subagent(
+    task: str,
+    tools: List[str],
+    context: str,
+    user_message: str,
+    allow_shell: bool,
+    queue_event: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    prompt = load_v2_prompt(
+        "sub_agent.txt",
+        "You are a Sub-Agent. Use allowed tools and finish with [TOOL]FINISH(result=\"...\")[/TOOL]."
+    )
+    allowed_tools = sorted(set(tools))
+    if "FINISH" not in allowed_tools:
+        allowed_tools.append("FINISH")
+
+    system_prompt = (
+        f"{prompt}\n\n"
+        "Syntax is case-sensitive.\n"
+        f"Allowed tools for this task: {', '.join(allowed_tools)}"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"task={task}\ncontext={context}",
+        },
+    ]
+    tool_events: List[Dict[str, Any]] = []
+    partial_notes: List[str] = []
+
+    for _ in range(V2_MAX_SUBAGENT_ROUNDS):
+        response = await LLMProvider.call(config.sub, messages, **kwargs)
+        assistant_raw = content_to_text(response["choices"][0]["message"]["content"]).strip()
+        parsed = await parse_agent_action(
+            role="subagent",
+            text=assistant_raw,
+            provider_cfg=config.sub,
+            allowed_tool_names=allowed_tools,
+            allow_subagent=False,
+            allow_direct_text=False,
+            **kwargs,
+        )
+
+        if parsed["type"] == "invalid":
+            fallback = (
+                "Sub-agent auto-finish: malformed syntax after repair attempt. "
+                "Returning partial progress."
+            )
+            if partial_notes:
+                fallback += f" Notes: {' | '.join(partial_notes)}"
+            return {
+                "role": "subagent",
+                "task": task,
+                "result": fallback,
+                "output": fallback,
+                "tool_events": tool_events,
+                "warnings": [parsed.get("reason", "invalid action")],
+            }
+
+        if parsed["type"] == "tool":
+            tool_name = parsed["tool_name"]
+            args = parsed["params"]
+            if tool_name == "FINISH":
+                result_text = args.get("result", "").strip()
+                return {
+                    "role": "subagent",
+                    "task": task,
+                    "result": result_text,
+                    "output": result_text,
+                    "tool_events": tool_events,
+                    "warnings": [],
+                }
+
+            if queue_event:
+                await queue_event("tool_call", {"name": tool_name, "args": args})
+            result, status = await execute_v2_tool(
+                tool_name,
+                args,
+                user_message=user_message,
+                allow_shell=allow_shell,
+            )
+            if queue_event:
+                await queue_event("tool_result", {"name": tool_name, "status": status, "result": truncate(result)})
+            tool_events.append({
+                "name": tool_name,
+                "args": args,
+                "status": status,
+                "result": truncate(result),
+            })
+            partial_notes.append(f"{tool_name}:{status}")
+            messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
+            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {status}):\n{result}"})
+            continue
+
+    timeout_result = "Sub-agent auto-finish: max rounds reached without FINISH."
+    return {
+        "role": "subagent",
+        "task": task,
+        "result": timeout_result,
+        "output": timeout_result,
+        "tool_events": tool_events,
+        "warnings": ["max rounds reached"],
+    }
+
+
+async def run_v2_orchestrator(
+    tasks: str,
+    context: str,
+    user_message: str,
+    allow_shell: bool,
+    queue_event: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    prompt = load_v2_prompt(
+        "orchestrator.txt",
+        "You are Orchestrator Agent. Execute one action per turn and finish with FINISH."
+    )
+    allowed_tool_names = [tool["function"]["name"] for tool in TOOLS_SPEC] + ["FINISH"]
+
+    messages = [
+        {"role": "system", "content": f"{prompt}\n\nSyntax is case-sensitive."},
+        {"role": "user", "content": f"tasks:\n{tasks}\n\ncontext:\n{context or ''}"},
+    ]
+
+    tool_events: List[Dict[str, Any]] = []
+    subagent_outputs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for _ in range(V2_MAX_ORCHESTRATOR_ROUNDS):
+        response = await LLMProvider.call(get_orchestrator_cfg(), messages, **kwargs)
+        assistant_raw = content_to_text(response["choices"][0]["message"]["content"]).strip()
+
+        parsed = await parse_agent_action(
+            role="orchestrator",
+            text=assistant_raw,
+            provider_cfg=get_orchestrator_cfg(),
+            allowed_tool_names=allowed_tool_names,
+            allow_subagent=True,
+            allow_direct_text=False,
+            **kwargs,
+        )
+
+        if parsed["type"] == "invalid":
+            warning = parsed.get("reason", "invalid action")
+            warnings.append(warning)
+            safe_finish = (
+                "Orchestrator auto-finish: malformed syntax after repair attempt. "
+                "Returning partial results."
+            )
+            if subagent_outputs:
+                safe_finish += " Sub-agent outputs included."
+            return {
+                "result": safe_finish,
+                "tool_events": tool_events,
+                "subagent_outputs": subagent_outputs,
+                "warnings": warnings,
+            }
+
+        if parsed["type"] == "subagent":
+            sub_task = parsed.get("task", "")
+            sub_tools = parsed.get("tools", [])
+            if queue_event:
+                await queue_event("stage", {"name": "subagent"})
+            sub_result = await run_v2_subagent(
+                task=sub_task,
+                tools=sub_tools,
+                context=context,
+                user_message=user_message,
+                allow_shell=allow_shell,
+                queue_event=queue_event,
+                **kwargs,
+            )
+            subagent_outputs.append(sub_result)
+            if queue_event:
+                await queue_event("subagent", sub_result)
+            messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
+            messages.append({"role": "system", "content": f"Sub-agent result:\n{sub_result.get('result', '')}"})
+            continue
+
+        if parsed["type"] == "tool":
+            tool_name = parsed["tool_name"]
+            args = parsed["params"]
+            if tool_name == "FINISH":
+                final_result = args.get("result", "").strip()
+                return {
+                    "result": final_result,
+                    "tool_events": tool_events,
+                    "subagent_outputs": subagent_outputs,
+                    "warnings": warnings,
+                }
+
+            if queue_event:
+                await queue_event("tool_call", {"name": tool_name, "args": args})
+            result, status = await execute_v2_tool(
+                tool_name,
+                args,
+                user_message=user_message,
+                allow_shell=allow_shell,
+            )
+            if queue_event:
+                await queue_event("tool_result", {"name": tool_name, "status": status, "result": truncate(result)})
+            tool_events.append({
+                "id": None,
+                "name": tool_name,
+                "args": args,
+                "status": status,
+                "result": result,
+                "created_at": now_iso(),
+            })
+            messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
+            messages.append({"role": "system", "content": f"Tool result ({tool_name}, {status}):\n{result}"})
+            continue
+
+    timeout_finish = "Orchestrator auto-finish: max rounds reached without FINISH."
+    warnings.append("max rounds reached")
+    return {
+        "result": timeout_finish,
+        "tool_events": tool_events,
+        "subagent_outputs": subagent_outputs,
+        "warnings": warnings,
+    }
+
+
+async def run_v2_pipeline(
+    request: ChatRequest,
+    session_id: str,
+    persistent: bool,
+    queue_event: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    if queue_event:
+        await queue_event("stage", {"name": "main_thinking"})
+
+    history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
+    transcript_turns = get_recent_turns(session_id, MAX_META_TURNS)
+    transcript = build_transcript(transcript_turns, request.message)
+
+    memory_files = ["soul.md", "user.md"]
+    if (MEMORY_DIR / "identity.md").exists():
+        memory_files.append("identity.md")
+    memory_context = load_memory_files(memory_files)
+
+    main_prompt = load_v2_prompt("main_agent.txt", "You are Main Agent.")
+    messages: List[Dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                f"{main_prompt}\n\n"
+                "Syntax is case-sensitive.\n"
+                "Main can only call summarizer or orchestrator.\n\n"
+                f"Memory context:\n{memory_context}"
+            ),
+        }
+    ]
+    for turn in history_turns:
+        messages.append({"role": "user", "content": turn["user_message"]})
+        messages.append({"role": "assistant", "content": turn["assistant_reply"]})
+    messages.append({"role": "user", "content": request.message})
+
+    allow_shell = session_policies[session_id].get("shell_command_allowed", False)
+    tool_events: List[Dict[str, Any]] = []
+    subagent_outputs: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
+    orchestrator_result = ""
+    warnings: List[str] = []
+
+    for _ in range(V2_MAX_MAIN_ROUNDS):
+        response = await LLMProvider.call(config.main, messages, **kwargs)
+        assistant_raw = content_to_text(response["choices"][0]["message"]["content"]).strip()
+        parsed = await parse_agent_action(
+            role="main",
+            text=assistant_raw,
+            provider_cfg=config.main,
+            allowed_tool_names=["summarizer", "orchestrator"],
+            allow_subagent=False,
+            allow_direct_text=True,
+            **kwargs,
+        )
+
+        if parsed["type"] == "invalid":
+            safe_reply = (
+                "I hit an internal action-format issue while processing your request. "
+                "I can still help directly if you want me to continue step by step."
+            )
+            warnings.append(parsed.get("reason", "invalid action"))
+            meta = {
+                "architecture_mode": "hierarchical_v2",
+                "warnings": warnings,
+                "summaries": summaries,
+                "orchestrator_result": orchestrator_result,
+            }
+            store_turn(
+                session_id=session_id,
+                persistent=persistent,
+                user_message=request.message,
+                assistant_reply=safe_reply,
+                meta_json=meta,
+                tool_events=tool_events,
+                subagent_outputs=subagent_outputs,
+                architecture_mode="hierarchical_v2",
+            )
+            if queue_event:
+                await queue_event("stage", {"name": "finish"})
+            return {
+                "reply": safe_reply,
+                "meta": meta,
+                "tool_events": tool_events,
+                "subagent_outputs": subagent_outputs,
+                "status": "ok",
+                "session_id": session_id,
+                "architecture_mode": "hierarchical_v2",
+            }
+
+        if parsed["type"] == "direct_text":
+            reply = parsed.get("content", assistant_raw)
+            meta = {
+                "architecture_mode": "hierarchical_v2",
+                "warnings": warnings,
+                "summaries": summaries,
+                "orchestrator_result": orchestrator_result,
+            }
+            store_turn(
+                session_id=session_id,
+                persistent=persistent,
+                user_message=request.message,
+                assistant_reply=reply,
+                meta_json=meta,
+                tool_events=tool_events,
+                subagent_outputs=subagent_outputs,
+                architecture_mode="hierarchical_v2",
+            )
+            if queue_event:
+                await queue_event("stage", {"name": "finish"})
+            return {
+                "reply": reply,
+                "meta": meta,
+                "tool_events": [
+                    {
+                        "id": ev.get("id"),
+                        "name": ev["name"],
+                        "args": ev["args"],
+                        "status": ev["status"],
+                        "result": truncate(ev["result"]),
+                        "created_at": ev["created_at"],
+                    }
+                    for ev in tool_events
+                ],
+                "subagent_outputs": subagent_outputs,
+                "status": "ok",
+                "session_id": session_id,
+                "architecture_mode": "hierarchical_v2",
+            }
+
+        if parsed["type"] == "tool":
+            tool_name = parsed["tool_name"]
+            params = parsed["params"]
+            messages.append({"role": "assistant", "content": parsed.get("raw", assistant_raw)})
+
+            if tool_name == "summarizer":
+                if queue_event:
+                    await queue_event("stage", {"name": "summarizer"})
+                query = params.get("query", "Summarize relevant context.")
+                summary = await run_v2_summarizer(query, transcript, **kwargs)
+                summaries.append({"query": query, "summary": summary})
+                messages.append({"role": "system", "content": f"Summarizer output:\n{summary}"})
+                continue
+
+            if tool_name == "orchestrator":
+                if queue_event:
+                    await queue_event("stage", {"name": "orchestrator"})
+                tasks = params.get("tasks", "")
+                context = params.get("context", "")
+                orchestrator_output = await run_v2_orchestrator(
+                    tasks=tasks,
+                    context=context,
+                    user_message=request.message,
+                    allow_shell=allow_shell,
+                    queue_event=queue_event,
+                    **kwargs,
+                )
+                orchestrator_result = orchestrator_output.get("result", "")
+                tool_events.extend(orchestrator_output.get("tool_events", []))
+                subagent_outputs.extend(orchestrator_output.get("subagent_outputs", []))
+                warnings.extend(orchestrator_output.get("warnings", []))
+                messages.append({"role": "system", "content": f"Orchestrator result:\n{orchestrator_result}"})
+                continue
+
+    fallback_reply = orchestrator_result or "I completed internal processing but could not finalize a stable response."
+    meta = {
+        "architecture_mode": "hierarchical_v2",
+        "warnings": warnings + ["main max rounds reached"],
+        "summaries": summaries,
+        "orchestrator_result": orchestrator_result,
+    }
+    store_turn(
+        session_id=session_id,
+        persistent=persistent,
+        user_message=request.message,
+        assistant_reply=fallback_reply,
+        meta_json=meta,
+        tool_events=tool_events,
+        subagent_outputs=subagent_outputs,
+        architecture_mode="hierarchical_v2",
+    )
+    if queue_event:
+        await queue_event("stage", {"name": "finish"})
+    return {
+        "reply": fallback_reply,
+        "meta": meta,
+        "tool_events": [
+            {
+                "id": ev.get("id"),
+                "name": ev["name"],
+                "args": ev["args"],
+                "status": ev["status"],
+                "result": truncate(ev["result"]),
+                "created_at": ev["created_at"],
+            }
+            for ev in tool_events
+        ],
+        "subagent_outputs": subagent_outputs,
+        "status": "ok",
+        "session_id": session_id,
+        "architecture_mode": "hierarchical_v2",
+    }
+
+
+async def run_legacy_pipeline(request: ChatRequest, session_id: str, persistent: bool) -> ChatResponse:
+    session_history, working_memory = build_session_context(session_id)
+    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
+
+    skills_list = list_available_skills()
+    skills_index = ", ".join(skills_list) if skills_list else "none"
+    memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
+
+    meta_results = await run_meta_layer(session_context, skills_index, memory_context, working_memory)
+    plan_result = meta_results.get("plan")
+    if not isinstance(plan_result, dict):
+        plan_result = {"just_chat": True, "plan": "respond conversationally"}
+
+    meta_output = MetaOutput(
+        intent=meta_results.get("intent"),
+        tone=meta_results.get("tone"),
+        user=meta_results.get("user"),
+        subject=meta_results.get("subject"),
+        needs=meta_results.get("needs"),
+        patterns=meta_results.get("patterns"),
+        plan=plan_result,
+        raw=meta_results.get("raw")
+    )
+
+    loaded_context = ""
+    if plan_result.get("load_memories"):
+        for query in plan_result["load_memories"]:
+            results = await execute_tool("memory_search", {"query": query})
+            loaded_context += f"Memory search '{query}': {results}\n"
+
+    if plan_result.get("load_skills"):
+        for skill in plan_result["load_skills"]:
+            content = await execute_tool("skill_load", {"name": skill})
+            loaded_context += f"Skill '{skill}': {content}\n"
+
+    subagent_outputs: List[Dict[str, Any]] = []
+    if plan_result.get("use_sub_agents"):
+        sub_tasks = plan_result.get("sub_agent_tasks", [])
+        sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
+        outputs = await run_subagents(sub_specs)
+        subagent_outputs.extend(outputs)
+        for output in outputs:
+            loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
+
+    history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
+    messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
+
+    shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
+    loop_result = await run_tool_loop(
+        config.main,
+        messages,
+        TOOLS_SPEC,
+        approval_mode="ask",
+        allow_shell=shell_allowed,
+        user_message=request.message,
+    )
+
+    if loop_result["status"] == "needs_approval":
+        pending_approvals[session_id] = {
+            "messages": loop_result["pending_messages"],
+            "tool_calls": loop_result["pending_tool_calls"],
+            "tool_events": loop_result["tool_events"],
+            "user_message": request.message,
+            "meta_json": meta_output.model_dump(),
+            "subagent_outputs": loop_result.get("subagent_outputs", []),
+            "persistent": persistent,
+            "architecture_mode": "legacy",
+        }
+        pending_tools = [
+            {
+                "id": tc.get("id"),
+                "name": tc.get("function", {}).get("name"),
+                "arguments": tc.get("function", {}).get("arguments", "{}"),
+            }
+            for tc in loop_result["pending_tool_calls"]
+        ]
+        return ChatResponse(
+            reply="Tool approval required to continue.",
+            meta=meta_output.model_dump(),
+            tool_events=[
+                {
+                    "id": ev.get("id"),
+                    "name": ev["name"],
+                    "args": ev["args"],
+                    "status": ev["status"],
+                    "result": truncate(ev["result"]),
+                    "created_at": ev["created_at"],
+                }
+                for ev in loop_result.get("tool_events", [])
+            ],
+            subagent_outputs=loop_result.get("subagent_outputs", []),
+            status="needs_approval",
+            pending_tools=pending_tools,
+            session_id=session_id,
+            architecture_mode="legacy",
+        )
+
+    reply = loop_result.get("content", "")
+    tool_events = loop_result.get("tool_events", [])
+    subagent_outputs = loop_result.get("subagent_outputs", [])
+
+    store_turn(
+        session_id=session_id,
+        persistent=persistent,
+        user_message=request.message,
+        assistant_reply=reply,
+        meta_json=meta_output.model_dump(),
+        tool_events=tool_events,
+        subagent_outputs=subagent_outputs,
+        architecture_mode="legacy",
+    )
+
+    user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+    identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+    gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
+    await apply_gatekeeper(session_id, persistent, gate_result)
+    meta_output.gatekeeper = gate_result
+
+    return ChatResponse(
+        reply=reply,
+        meta=meta_output.model_dump(),
+        tool_events=[
+            {
+                "id": ev.get("id"),
+                "name": ev["name"],
+                "args": ev["args"],
+                "status": ev["status"],
+                "result": truncate(ev["result"]),
+                "created_at": ev["created_at"],
+            }
+            for ev in tool_events
+        ],
+        subagent_outputs=subagent_outputs,
+        status="ok",
+        session_id=session_id,
+        architecture_mode="legacy",
+    )
+
+
+# =============================================================================
 # API ENDPOINTS
 # =============================================================================
 
@@ -1860,6 +2781,30 @@ async def chat_stream(request: ChatRequest):
 
     async def run_orchestration():
         try:
+            architecture_mode = get_architecture_mode()
+            if architecture_mode == "hierarchical_v2":
+                await queue_event("meta", {"architecture_mode": "hierarchical_v2"})
+                v2_result = await run_v2_pipeline(
+                    request=request,
+                    session_id=session_id,
+                    persistent=persistent,
+                    queue_event=queue_event,
+                    **call_kwargs,
+                )
+                if "meta" not in v2_result or not isinstance(v2_result.get("meta"), dict):
+                    v2_result["meta"] = {"architecture_mode": "hierarchical_v2"}
+                await queue_event("assistant", {
+                    "content": v2_result.get("reply", ""),
+                    "meta": v2_result.get("meta"),
+                    "tool_events": v2_result.get("tool_events", []),
+                    "subagent_outputs": v2_result.get("subagent_outputs", []),
+                    "session_id": session_id,
+                    "architecture_mode": "hierarchical_v2",
+                })
+                await queue_event("done", {"session_id": session_id, "architecture_mode": "hierarchical_v2"})
+                await event_queue.put(None)
+                return
+
             await queue_event("stage", {"name": "meta_start"})
             session_history, working_memory = build_session_context(session_id)
             subagent_outputs: List[Dict[str, Any]] = []
@@ -1962,6 +2907,7 @@ async def chat_stream(request: ChatRequest):
                             "meta_json": meta_output.model_dump(),
                             "subagent_outputs": subagent_outputs,
                             "persistent": persistent,
+                            "architecture_mode": "legacy",
                         }
                         pending_tools = [
                             {
@@ -1986,6 +2932,7 @@ async def chat_stream(request: ChatRequest):
                                 for ev in tool_events
                             ],
                             "session_id": session_id,
+                            "architecture_mode": "legacy",
                         })
                         await event_queue.put(None)
                         return
@@ -2084,8 +3031,9 @@ async def chat_stream(request: ChatRequest):
                     ],
                     "subagent_outputs": subagent_outputs,
                     "session_id": session_id,
+                    "architecture_mode": "legacy",
                 })
-                await queue_event("done", {"session_id": session_id})
+                await queue_event("done", {"session_id": session_id, "architecture_mode": "legacy"})
                 await event_queue.put(None)
                 return
 
@@ -2115,8 +3063,9 @@ async def chat_stream(request: ChatRequest):
                 ],
                 "subagent_outputs": subagent_outputs,
                 "session_id": session_id,
+                "architecture_mode": "legacy",
             })
-            await queue_event("done", {"session_id": session_id})
+            await queue_event("done", {"session_id": session_id, "architecture_mode": "legacy"})
             await event_queue.put(None)
         except Exception as e:
             logger.error(f"Error in orchestration: {e}")
@@ -2153,142 +3102,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     ensure_session_policy(session_id)
     persistent = session_id not in temp_sessions
-
-    session_history, working_memory = build_session_context(session_id)
-    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
-
-    skills_list = list_available_skills()
-    skills_index = ", ".join(skills_list) if skills_list else "none"
-    memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
-
-    meta_results = await run_meta_layer(session_context, skills_index, memory_context, working_memory)
-    plan_result = meta_results.get("plan")
-    if not isinstance(plan_result, dict):
-        plan_result = {"just_chat": True, "plan": "respond conversationally"}
-
-    meta_output = MetaOutput(
-        intent=meta_results.get("intent"),
-        tone=meta_results.get("tone"),
-        user=meta_results.get("user"),
-        subject=meta_results.get("subject"),
-        needs=meta_results.get("needs"),
-        patterns=meta_results.get("patterns"),
-        plan=plan_result,
-        raw=meta_results.get("raw")
-    )
-
-    # Load requested context from planner
-    loaded_context = ""
-    if plan_result.get("load_memories"):
-        for query in plan_result["load_memories"]:
-            results = await execute_tool("memory_search", {"query": query})
-            loaded_context += f"Memory search '{query}': {results}\n"
-
-    if plan_result.get("load_skills"):
-        for skill in plan_result["load_skills"]:
-            content = await execute_tool("skill_load", {"name": skill})
-            loaded_context += f"Skill '{skill}': {content}\n"
-
-    # Sub agents triggered by planner
-    subagent_outputs = []
-    if plan_result.get("use_sub_agents"):
-        sub_tasks = plan_result.get("sub_agent_tasks", [])
-        sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
-        outputs = await run_subagents(sub_specs)
-        subagent_outputs.extend(outputs)
-        for output in outputs:
-            loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
-
-    history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
-    messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
-
-    shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
-    loop_result = await run_tool_loop(
-        config.main,
-        messages,
-        TOOLS_SPEC,
-        approval_mode="ask",
-        allow_shell=shell_allowed,
-        user_message=request.message,
-    )
-
-    if loop_result["status"] == "needs_approval":
-        pending_approvals[session_id] = {
-            "messages": loop_result["pending_messages"],
-            "tool_calls": loop_result["pending_tool_calls"],
-            "tool_events": loop_result["tool_events"],
-            "user_message": request.message,
-            "meta_json": meta_output.model_dump(),
-            "subagent_outputs": loop_result.get("subagent_outputs", []),
-            "persistent": persistent,
-        }
-        pending_tools = [
-            {
-                "id": tc.get("id"),
-                "name": tc.get("function", {}).get("name"),
-                "arguments": tc.get("function", {}).get("arguments", "{}"),
-            }
-            for tc in loop_result["pending_tool_calls"]
-        ]
-        return ChatResponse(
-            reply="Tool approval required to continue.",
-            meta=meta_output.model_dump(),
-            tool_events=[
-                {
-                    "id": ev.get("id"),
-                    "name": ev["name"],
-                    "args": ev["args"],
-                    "status": ev["status"],
-                    "result": truncate(ev["result"]),
-                    "created_at": ev["created_at"],
-                }
-                for ev in loop_result.get("tool_events", [])
-            ],
-            subagent_outputs=loop_result.get("subagent_outputs", []),
-            status="needs_approval",
-            pending_tools=pending_tools,
+    if get_architecture_mode() == "hierarchical_v2":
+        v2_result = await run_v2_pipeline(
+            request=request,
             session_id=session_id,
+            persistent=persistent,
+        )
+        return ChatResponse(
+            reply=v2_result.get("reply", ""),
+            meta=v2_result.get("meta"),
+            tool_events=v2_result.get("tool_events", []),
+            subagent_outputs=v2_result.get("subagent_outputs", []),
+            status=v2_result.get("status", "ok"),
+            pending_tools=v2_result.get("pending_tools"),
+            session_id=v2_result.get("session_id", session_id),
+            architecture_mode="hierarchical_v2",
         )
 
-    reply = loop_result.get("content", "")
-    tool_events = loop_result.get("tool_events", [])
-    subagent_outputs = loop_result.get("subagent_outputs", [])
-
-    store_turn(
-        session_id=session_id,
-        persistent=persistent,
-        user_message=request.message,
-        assistant_reply=reply,
-        meta_json=meta_output.model_dump(),
-        tool_events=tool_events,
-        subagent_outputs=subagent_outputs,
-    )
-
-    # Layer 5: Gatekeeper
-    user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
-    identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
-    gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
-    await apply_gatekeeper(session_id, persistent, gate_result)
-    meta_output.gatekeeper = gate_result
-
-    return ChatResponse(
-        reply=reply,
-        meta=meta_output.model_dump(),
-        tool_events=[
-            {
-                "id": ev.get("id"),
-                "name": ev["name"],
-                "args": ev["args"],
-                "status": ev["status"],
-                "result": truncate(ev["result"]),
-                "created_at": ev["created_at"],
-            }
-            for ev in tool_events
-        ],
-        subagent_outputs=subagent_outputs,
-        status="ok",
-        session_id=session_id,
-    )
+    return await run_legacy_pipeline(request, session_id, persistent)
 
 
 @app.post("/api/tools/approve")
@@ -2304,6 +3135,7 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
     meta_json = pending.get("meta_json", {})
     subagent_outputs = pending.get("subagent_outputs", [])
     persistent = pending.get("persistent", request.session_id not in temp_sessions)
+    architecture_mode = pending.get("architecture_mode", "legacy")
 
     allow_shell = request.decision in ["run_once", "allow_session"]
     if request.decision == "allow_session":
@@ -2365,6 +3197,7 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
             "meta_json": meta_json,
             "subagent_outputs": subagent_outputs + loop_result.get("subagent_outputs", []),
             "persistent": persistent,
+            "architecture_mode": architecture_mode,
         }
         pending_tools = [
             {
@@ -2392,6 +3225,7 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
             status="needs_approval",
             pending_tools=pending_tools,
             session_id=request.session_id,
+            architecture_mode=architecture_mode,
         )
 
     reply = loop_result.get("content", "")
@@ -2406,18 +3240,20 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
         meta_json=meta_json,
         tool_events=tool_events,
         subagent_outputs=subagent_outputs,
+        architecture_mode=architecture_mode,
     )
 
-    # Layer 5: Gatekeeper
-    session_history, _ = build_session_context(request.session_id)
-    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {original_user_message}"
-    user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
-    identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
-    gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
-    await apply_gatekeeper(request.session_id, persistent, gate_result)
+    if architecture_mode == "legacy":
+        # Layer 5: Gatekeeper (legacy only)
+        session_history, _ = build_session_context(request.session_id)
+        session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {original_user_message}"
+        user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
+        identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
+        gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
+        await apply_gatekeeper(request.session_id, persistent, gate_result)
 
-    if isinstance(meta_json, dict):
-        meta_json["gatekeeper"] = gate_result
+        if isinstance(meta_json, dict):
+            meta_json["gatekeeper"] = gate_result
 
     return ChatResponse(
         reply=reply,
@@ -2436,6 +3272,7 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
         subagent_outputs=subagent_outputs,
         status="ok",
         session_id=request.session_id,
+        architecture_mode=architecture_mode,
     )
 
 

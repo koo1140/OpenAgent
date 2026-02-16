@@ -1,0 +1,282 @@
+{
+  "title": "AGI Agent Flow - Single Model with Orchestrator",
+  "description": "A hierarchical agent system where Main Agent uses one tool (orchestrator) for complex tasks",
+  "version": "2.0",
+  "agents": [
+    {
+      "id": "main_agent",
+      "name": "Main Agent",
+      "type": "primary",
+      "description": "Chat interface with user, has access to memory files (user.md, soul.md)",
+      "inputs": [
+        "user.md (memory file)",
+        "soul.md (memory file)",
+        "conversation_history",
+        "user_message"
+      ],
+      "outputs": [
+        "direct_response (to user)",
+        "tool_call: summarizer (optional)",
+        "tool_call: orchestrator (with detailed tasks)"
+      ],
+      "system_prompt": "Main Agent - System Prompt (Full)",
+      "tools": ["summarizer", "orchestrator"],
+      "max_tool_calls_per_turn": 1,
+      "linked_to": ["summarizer_agent", "orchestrator_agent"]
+    },
+    {
+      "id": "summarizer_agent",
+      "name": "Summarizer Agent",
+      "type": "utility",
+      "description": "Optional utility that provides concise conversation summaries when called by Main Agent",
+      "inputs": [
+        "query (what to summarize)",
+        "full_conversation_history (auto-provided)"
+      ],
+      "outputs": [
+        "plain_text_summary"
+      ],
+      "system_prompt": "Summarizer Agent – System Prompt (Full)",
+      "tools": [],
+      "linked_to": ["main_agent"]
+    },
+    {
+      "id": "orchestrator_agent",
+      "name": "Orchestrator Agent",
+      "type": "planner",
+      "description": "Executes complex tasks by creating plans, spawning sub-agents, and calling tools",
+      "inputs": [
+        "tasks (detailed list from Main Agent)",
+        "context (optional summary or additional info)"
+      ],
+      "outputs": [
+        "tool_calls",
+        "sub_agent_creations",
+        "FINISH(result)"
+      ],
+      "system_prompt": "Orchestrator Agent – System Prompt (Full)",
+      "tools": ["* (all available tools)"],
+      "capabilities": ["spawn_sub_agents"],
+      "linked_to": ["sub_agent"]
+    },
+    {
+      "id": "sub_agent",
+      "name": "Sub-Agent",
+      "type": "worker",
+      "description": "Isolated worker that handles one specific sub-task using given tools",
+      "inputs": [
+        "task (specific sub-task description)",
+        "tools (list of permitted tools)"
+      ],
+      "outputs": [
+        "tool_calls",
+        "FINISH(result)"
+      ],
+      "system_prompt": "Sub-Agent – System Prompt (Full)",
+      "tools": ["* (subset assigned by orchestrator)"],
+      "is_ephemeral": true,
+      "linked_to": ["orchestrator_agent"]
+    }
+  ],
+  "flow": {
+    "start": "user_input",
+    "nodes": [
+      {
+        "id": "user_input",
+        "type": "start",
+        "description": "User sends a message",
+        "next": "main_agent_thinking"
+      },
+      {
+        "id": "main_agent_thinking",
+        "type": "process",
+        "agent": "main_agent",
+        "description": "Main Agent analyzes user message, checks memories (user.md, soul.md), decides action",
+        "next": "main_agent_decision"
+      },
+      {
+        "id": "main_agent_decision",
+        "type": "decision",
+        "description": "Main Agent decides how to respond",
+        "branches": [
+          {
+            "condition": "simple_response",
+            "description": "Request is simple enough to answer directly",
+            "next": "direct_response"
+          },
+          {
+            "condition": "needs_summarizer",
+            "description": "Main Agent wants conversation summary first",
+            "next": "call_summarizer"
+          },
+          {
+            "condition": "needs_orchestrator",
+            "description": "Request requires complex multi-step processing",
+            "next": "call_orchestrator"
+          }
+        ]
+      },
+      {
+        "id": "direct_response",
+        "type": "end",
+        "agent": "main_agent",
+        "description": "Main Agent responds directly to user",
+        "output": "message_to_user"
+      },
+      {
+        "id": "call_summarizer",
+        "type": "tool_call",
+        "agent": "main_agent",
+        "tool": "summarizer",
+        "description": "Main Agent calls summarizer tool with query",
+        "next": "summarizer_process"
+      },
+      {
+        "id": "summarizer_process",
+        "type": "agent_execution",
+        "agent": "summarizer_agent",
+        "description": "Summarizer Agent runs with query and conversation history",
+        "next": "summarizer_result"
+      },
+      {
+        "id": "summarizer_result",
+        "type": "result",
+        "description": "Summarizer returns plain text summary to Main Agent",
+        "next": "main_agent_with_summary"
+      },
+      {
+        "id": "main_agent_with_summary",
+        "type": "process",
+        "agent": "main_agent",
+        "description": "Main Agent incorporates summary and decides next action",
+        "next": "main_agent_decision"
+      },
+      {
+        "id": "call_orchestrator",
+        "type": "tool_call",
+        "agent": "main_agent",
+        "tool": "orchestrator",
+        "description": "Main Agent calls orchestrator with detailed tasks and optional context",
+        "parameters": {
+          "tasks": "string (detailed numbered list)",
+          "context": "optional string"
+        },
+        "next": "orchestrator_planning"
+      },
+      {
+        "id": "orchestrator_planning",
+        "type": "process",
+        "agent": "orchestrator_agent",
+        "description": "Orchestrator analyzes tasks, creates plan, decides if work can be split",
+        "next": "orchestrator_execution_loop"
+      },
+      {
+        "id": "orchestrator_execution_loop",
+        "type": "loop",
+        "description": "Orchestrator executes plan steps sequentially",
+        "until": "all_steps_complete",
+        "next": "orchestrator_finish",
+        "subnodes": [
+          {
+            "id": "orchestrator_next_step",
+            "type": "decision",
+            "description": "Orchestrator decides next action based on plan",
+            "branches": [
+              {
+                "condition": "tool_call_needed",
+                "description": "Next step is a direct tool call",
+                "next": "orchestrator_tool_call"
+              },
+              {
+                "condition": "subagent_needed",
+                "description": "Next step requires spawning a sub-agent for independent work",
+                "next": "spawn_sub_agent"
+              }
+            ]
+          },
+          {
+            "id": "orchestrator_tool_call",
+            "type": "tool_call",
+            "agent": "orchestrator_agent",
+            "description": "Orchestrator calls a tool",
+            "next": "orchestrator_tool_result"
+          },
+          {
+            "id": "orchestrator_tool_result",
+            "type": "result",
+            "description": "Tool returns result to orchestrator",
+            "next": "orchestrator_execution_loop"
+          },
+          {
+            "id": "spawn_sub_agent",
+            "type": "subagent_creation",
+            "agent": "orchestrator_agent",
+            "description": "Orchestrator spawns isolated sub-agent with specific task and tools",
+            "syntax": "[SUBAGENT task=\"...\" tools=\"...\"]",
+            "next": "sub_agent_execution"
+          },
+          {
+            "id": "sub_agent_execution",
+            "type": "agent_execution",
+            "agent": "sub_agent",
+            "description": "Sub-agent runs with its task and tools, may make multiple tool calls",
+            "next": "sub_agent_result"
+          },
+          {
+            "id": "sub_agent_result",
+            "type": "result",
+            "description": "Sub-agent calls FINISH and returns result to orchestrator",
+            "next": "orchestrator_execution_loop"
+          }
+        ]
+      },
+      {
+        "id": "orchestrator_finish",
+        "type": "tool_call",
+        "agent": "orchestrator_agent",
+        "tool": "FINISH",
+        "description": "All steps complete, orchestrator calls FINISH with combined summary",
+        "parameters": {
+          "result": "string (combined summary of all work)"
+        },
+        "next": "orchestrator_result_to_main"
+      },
+      {
+        "id": "orchestrator_result_to_main",
+        "type": "result",
+        "description": "FINISH result delivered to Main Agent",
+        "next": "main_agent_with_result"
+      },
+      {
+        "id": "main_agent_with_result",
+        "type": "process",
+        "agent": "main_agent",
+        "description": "Main Agent receives orchestrator result and crafts final response",
+        "next": "final_response"
+      },
+      {
+        "id": "final_response",
+        "type": "end",
+        "agent": "main_agent",
+        "description": "Main Agent responds to user with natural language answer",
+        "output": "message_to_user"
+      }
+    ]
+  },
+  "syntax": {
+    "tool_call": "[TOOL]tool_name(parameter=\"value\")[/TOOL]",
+    "subagent_creation": "[SUBAGENT task=\"description\" tools=\"list\"]",
+    "finish_tool": "[TOOL]FINISH(result=\"...\")[/TOOL]"
+  },
+  "memory_files": {
+    "user.md": "Injected into Main Agent system prompt. Contains user preferences, history, personal information.",
+    "soul.md": "Injected into Main Agent system prompt. Contains core principles, guidelines, and identity."
+  },
+  "context_management": {
+    "main_agent": "Persists throughout session with full conversation history",
+    "orchestrator_agent": "New context each invocation, cleared after FINISH",
+    "sub_agent": "New context per spawn, cleared after FINISH",
+    "summarizer_agent": "New context per call, cleared after returning summary"
+  }
+}
+

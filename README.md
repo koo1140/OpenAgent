@@ -6,7 +6,12 @@ A sophisticated multi-agent LLM orchestration system with meta-cognitive capabil
 
 ## Overview
 
-This system implements a sophisticated five-layer agentic architecture:
+This system implements dual architecture modes:
+
+- `legacy` (existing five-layer pipeline)
+- `hierarchical_v2` (Main -> Summarizer optional -> Orchestrator -> Sub-Agent strict syntax)
+
+The legacy mode uses a sophisticated five-layer architecture:
 
 1. **Layer 1: Meta-Analysis** - Observational consciousness analyzing intent, tone, and patterns across 6 dimensions.
 2. **Layer 2: System Planner** - Strategic layer that processes meta-analysis to decide on memory loading, tool strategies, and sub-agent deployment.
@@ -144,6 +149,7 @@ python main.py
 Example configuration:
 ```json
 {
+  "architecture_mode": "legacy",
   "meta": {
     "provider": "Groq",
     "provider_type": "openai_compatible",
@@ -172,6 +178,26 @@ Example configuration:
     "base_url": null,
     "headers": null,
     "supports_tools": true,
+    "supports_response_format": false
+  },
+  "orchestrator": {
+    "provider": "Groq",
+    "provider_type": "openai_compatible",
+    "model": "mixtral-8x7b-32768",
+    "api_key": "your-groq-key",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
+  },
+  "summarizer": {
+    "provider": "Groq",
+    "provider_type": "openai_compatible",
+    "model": "mixtral-8x7b-32768",
+    "api_key": "your-groq-key",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": false,
     "supports_response_format": false
   }
 }
@@ -476,7 +502,8 @@ Returns:
   "subagent_outputs": [...],
   "status": "ok | needs_approval",
   "pending_tools": [...],
-  "session_id": "uuid"
+  "session_id": "uuid",
+  "architecture_mode": "legacy | hierarchical_v2"
 }
 ```
 

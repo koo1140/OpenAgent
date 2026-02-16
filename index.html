@@ -1052,6 +1052,15 @@ input[type="checkbox"] {
   </header>
   <div class="settings">
     <div class="agent-card">
+      <div class="agent-title">Architecture Mode</div>
+      <label>Mode</label>
+      <select id="architecture_mode">
+        <option value="legacy">legacy</option>
+        <option value="hierarchical_v2">hierarchical_v2</option>
+      </select>
+    </div>
+
+    <div class="agent-card">
       <div class="agent-title">Meta Agent</div>
       <label>Provider</label>
       <select id="meta_provider"></select>
@@ -1099,6 +1108,40 @@ input[type="checkbox"] {
       <textarea class="small" id="sub_headers" placeholder='{"x-custom":"value"}'></textarea>
       <div class="row">
         <label><input type="checkbox" id="sub_supports_tools"> Supports Tools</label>
+      </div>
+    </div>
+
+    <div class="agent-card">
+      <div class="agent-title">Orchestrator Agent</div>
+      <label>Provider</label>
+      <select id="orchestrator_provider"></select>
+      <label>Model</label>
+      <input type="text" id="orchestrator_model" placeholder="e.g. gpt-4">
+      <label>API Key</label>
+      <input type="password" id="orchestrator_key" placeholder="sk-...">
+      <label>Base URL (optional)</label>
+      <input type="text" id="orchestrator_base_url" placeholder="https://api.openai.com/v1/chat/completions">
+      <label>Headers (JSON, optional)</label>
+      <textarea class="small" id="orchestrator_headers" placeholder='{\"x-custom\":\"value\"}'></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="orchestrator_supports_tools"> Supports Tools</label>
+      </div>
+    </div>
+
+    <div class="agent-card">
+      <div class="agent-title">Summarizer Agent</div>
+      <label>Provider</label>
+      <select id="summarizer_provider"></select>
+      <label>Model</label>
+      <input type="text" id="summarizer_model" placeholder="e.g. gpt-4">
+      <label>API Key</label>
+      <input type="password" id="summarizer_key" placeholder="sk-...">
+      <label>Base URL (optional)</label>
+      <input type="text" id="summarizer_base_url" placeholder="https://api.openai.com/v1/chat/completions">
+      <label>Headers (JSON, optional)</label>
+      <textarea class="small" id="summarizer_headers" placeholder='{\"x-custom\":\"value\"}'></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="summarizer_supports_tools"> Supports Tools</label>
       </div>
     </div>
 
@@ -1156,6 +1199,7 @@ let progressCurrent = 0;
 let progressTarget = 0;
 let progressRaf = null;
 let progressTicker = null;
+let currentArchitectureMode = "legacy";
 
 function renderProgress(){
   progressBarFill.style.width = progressCurrent.toFixed(1) + "%";
@@ -1404,7 +1448,7 @@ function buildDetailsHTML(meta, toolEvents, subagentOutputs){
     subagentOutputs.forEach(sub => {
       html += `<div class="tool-event">`;
       html += `<div class="tool-title">Subagent: ${sub.task}</div>`;
-      html += `<pre>${sub.output}</pre>`;
+      html += `<pre>${sub.result || sub.output || ""}</pre>`;
       html += `</div>`;
     });
   }
@@ -1485,7 +1529,7 @@ async function openSession(id){
     chat.innerHTML = "";
     data.turns.forEach(t => {
       addMessage(t.user_message, "user");
-      addAssistantMessage(t.assistant_reply, t.meta_json, t.tool_events, t.subagent_outputs);
+      addAssistantMessage(t.assistant_reply, t.meta_json || t.meta, t.tool_events, t.subagent_outputs);
     });
     if(data.turns.length === 0){
       chat.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🤖</div><div class="empty-state-text">Start a conversation</div></div>';
@@ -1639,15 +1683,26 @@ function handleSSEChunk(chunk){
 }
 
 function handleSSEEvent(eventType, payload){
+  if(payload && payload.architecture_mode){
+    currentArchitectureMode = payload.architecture_mode;
+  }
   if(eventType === "stage"){
     const name = payload.name || "";
-    const map = {
-      "meta_start": ["Meta + Planner...", 8],
-      "planning_start": ["System Planner...", 30],
-      "gatekeeper_start": ["Gatekeeper...", 90],
-      "subagents_start": ["Subagents...", 50],
-      "tools_start": ["Tools...", 70]
-    };
+    const map = currentArchitectureMode === "hierarchical_v2"
+      ? {
+          "main_thinking": ["Main Agent...", 12],
+          "summarizer": ["Summarizer...", 30],
+          "orchestrator": ["Orchestrator...", 45],
+          "subagent": ["Sub-Agent...", 65],
+          "finish": ["Finalizing...", 90]
+        }
+      : {
+          "meta_start": ["Meta + Planner...", 8],
+          "planning_start": ["System Planner...", 30],
+          "gatekeeper_start": ["Gatekeeper...", 90],
+          "subagents_start": ["Subagents...", 50],
+          "tools_start": ["Tools...", 70]
+        };
     const [msg, percent] = map[name] || [name, 0];
     showProgress(msg, percent);
     return;
@@ -1782,7 +1837,7 @@ async function loadProviders(){
     if(!res.ok) throw new Error("Failed to load providers");
     providers = await res.json();
     const providerNames = Object.keys(providers);
-    ["meta","main","sub"].forEach(prefix => {
+    ["meta","main","sub","orchestrator","summarizer"].forEach(prefix => {
       const select = document.getElementById(`${prefix}_provider`);
       select.innerHTML = "";
       providerNames.forEach(name => {
@@ -1826,9 +1881,13 @@ async function loadConfig(){
     const res = await fetch("/api/config");
     if(!res.ok) return;
     const data = await res.json();
+    currentArchitectureMode = data.architecture_mode || "legacy";
+    document.getElementById("architecture_mode").value = currentArchitectureMode;
     fillProviderFields("meta", data.meta || {});
     fillProviderFields("main", data.main || {});
     fillProviderFields("sub", data.sub || {});
+    fillProviderFields("orchestrator", data.orchestrator || data.meta || data.main || {});
+    fillProviderFields("summarizer", data.summarizer || data.meta || data.main || {});
   }catch(err){
     showError(err.message);
   }
@@ -1852,10 +1911,14 @@ function buildProviderPayload(prefix){
 
 async function saveConfig(){
   try{
+    currentArchitectureMode = document.getElementById("architecture_mode").value || "legacy";
     const payload = {
+      architecture_mode: currentArchitectureMode,
       meta: buildProviderPayload("meta"),
       main: buildProviderPayload("main"),
-      sub: buildProviderPayload("sub")
+      sub: buildProviderPayload("sub"),
+      orchestrator: buildProviderPayload("orchestrator"),
+      summarizer: buildProviderPayload("summarizer")
     };
     const res=await fetch("/api/config",{
       method:"POST",

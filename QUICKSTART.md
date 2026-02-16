@@ -37,6 +37,10 @@ python main.py
 - **Model**: `llama3-70b-8192`
 - **API Key**: Your Groq API key
 
+### Architecture Mode
+- `legacy` keeps the original meta/planner pipeline
+- `hierarchical_v2` enables Main + Summarizer + Orchestrator + Sub-Agent strict `[TOOL]` syntax flow
+
 4. Click **Save Configuration**
 5. Click **Chat** and start chatting!
 
@@ -68,6 +72,7 @@ You can create, rename, and resume sessions from the Sessions panel.
 
 ```json
 {
+  "architecture_mode": "legacy",
   "meta": {
     "provider": "Groq",
     "provider_type": "openai_compatible",
@@ -96,6 +101,26 @@ You can create, rename, and resume sessions from the Sessions panel.
     "base_url": null,
     "headers": null,
     "supports_tools": true,
+    "supports_response_format": false
+  },
+  "orchestrator": {
+    "provider": "Groq",
+    "provider_type": "openai_compatible",
+    "model": "mixtral-8x7b-32768",
+    "api_key": "gsk_...",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": true,
+    "supports_response_format": false
+  },
+  "summarizer": {
+    "provider": "Groq",
+    "provider_type": "openai_compatible",
+    "model": "mixtral-8x7b-32768",
+    "api_key": "gsk_...",
+    "base_url": null,
+    "headers": null,
+    "supports_tools": false,
     "supports_response_format": false
   }
 }
