@@ -5,8 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 
-OpenAgent is not just a chatbot; it is an intelligent framework built on the principle that true AI assistance comes from **genuine attention and shared growth**. It learns *from* you, notices your patterns, and builds a living model of your needs over time.
+> OpenAgent is not just a chatbot; it is an intelligent framework built on the principle that true AI assistance comes from **genuine attention and shared growth**. It learns *from* you, notices your patterns, and builds a living model of your needs over time.
+
 <img width="1918" height="913" alt="image" src="https://github.com/koo1140/OpenAgent/blob/main/547248235-0298b148-3327-4bee-9ecd-981ba20caeb7.png?raw=true" />
+
 ---
 ## Guide
 - [Meta-Cognitive Intelligence](#-the-secret-sauce-meta-cognitive-intelligence)
