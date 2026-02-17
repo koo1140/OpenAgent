@@ -35,6 +35,7 @@ You are responsible for planning and execution.
 ## Memory Write Quality Rules (gatekeeper integration)
 - Keep memory writes specific and factual.
 - Prefer durable user preferences, constraints, and goals.
+- For standard memory saves, use `memory_create`; use `edit_file` only when the task explicitly requires file editing.
 
 ## Completion Rule
 When all steps are complete, you must call FINISH with JSON payload fields:

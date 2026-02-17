@@ -656,6 +656,8 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to read"},
+                    "file_path": {"type": "string", "description": "Alias for path"},
+                    "file": {"type": "string", "description": "Alias for path"},
                 },
                 "required": ["path"],
             },
@@ -670,10 +672,16 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to edit"},
+                    "file_path": {"type": "string", "description": "Alias for path"},
+                    "file": {"type": "string", "description": "Alias for path"},
                     "content": {"type": "string", "description": "New content to write"},
+                    "search": {"type": "string", "description": "Text or regex pattern to find"},
+                    "replace": {"type": "string", "description": "Replacement text for search"},
+                    "regex": {"type": "boolean", "description": "Whether search is regex (default true)"},
+                    "max_replacements": {"type": "integer", "description": "Maximum number of replacements; default 1"},
                     "mode": {"type": "string", "enum": ["write", "append"], "description": "Write mode"},
                 },
-                "required": ["path", "content"],
+                "required": ["path"],
             },
         },
     },
@@ -877,7 +885,16 @@ def normalize_and_validate_tool_arguments(name: str, arguments: Dict[str, Any]) 
     params_schema = schemas.get(name, {}) or {}
     props = params_schema.get("properties", {}) or {}
     required = params_schema.get("required", []) or []
-    args = arguments if isinstance(arguments, dict) else {}
+    args = dict(arguments) if isinstance(arguments, dict) else {}
+
+    if name in {"read_file", "edit_file"}:
+        # Compatibility aliases used by older prompts and model outputs.
+        if "path" not in args:
+            alias_path = args.get("file_path")
+            if alias_path is None:
+                alias_path = args.get("file")
+            if alias_path is not None:
+                args["path"] = alias_path
 
     unknown = sorted([key for key in args.keys() if key not in props])
     if unknown:
@@ -903,6 +920,27 @@ def normalize_and_validate_tool_arguments(name: str, arguments: Dict[str, Any]) 
         value = normalized.get(key)
         if isinstance(value, str) and not value.strip():
             return None, f"parameter '{key}' must be non-empty"
+
+    if name in {"read_file", "edit_file"}:
+        normalized.pop("file_path", None)
+        normalized.pop("file", None)
+
+    if name == "edit_file":
+        has_content = "content" in normalized
+        has_search = "search" in normalized or "replace" in normalized
+        if has_content and has_search:
+            return None, "edit_file must use either 'content' or ('search' and 'replace'), not both"
+        if not has_content and not has_search:
+            return None, "edit_file requires either 'content' or both 'search' and 'replace'"
+        if has_search:
+            if "search" not in normalized or "replace" not in normalized:
+                return None, "edit_file requires both 'search' and 'replace' when using replacement mode"
+            search_value = normalized.get("search")
+            if isinstance(search_value, str) and not search_value:
+                return None, "parameter 'search' must be non-empty"
+            max_replacements = normalized.get("max_replacements")
+            if isinstance(max_replacements, int) and max_replacements < 1:
+                return None, "parameter 'max_replacements' must be >= 1"
 
     return normalized, None
 
@@ -1000,6 +1038,19 @@ def filter_tools(allowed: Optional[List[str]]) -> List[Dict[str, Any]]:
     return [tool for tool in TOOLS_SPEC if tool["function"]["name"] in allowed_set]
 
 
+def resolve_tool_path(raw_path: str) -> Path:
+    path = Path((raw_path or "").strip())
+    if path.is_absolute():
+        return path
+    if path.parent != Path("."):
+        return path
+
+    memory_candidate = MEMORY_DIR / path.name
+    if memory_candidate.exists() or path.name in {"identity.md", "user.md", "soul.md"}:
+        return memory_candidate
+    return path
+
+
 async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     try:
         normalized_args, validation_error = normalize_and_validate_tool_arguments(name, arguments)
@@ -1021,7 +1072,7 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             raw_path = (arguments.get("path") or "").strip()
             if not raw_path:
                 return "Tool validation error: read_file requires non-empty 'path'"
-            path = Path(raw_path)
+            path = resolve_tool_path(raw_path)
             if not path.exists():
                 return f"Error: File {path} does not exist"
             if path.is_dir():
@@ -1035,9 +1086,41 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             raw_path = (arguments.get("path") or "").strip()
             if not raw_path:
                 return "Tool validation error: edit_file requires non-empty 'path'"
-            path = Path(raw_path)
+            path = resolve_tool_path(raw_path)
             if path.exists() and path.is_dir():
                 return f"Tool validation error: edit_file path '{path}' is a directory; pass a file path"
+
+            if "search" in arguments or "replace" in arguments:
+                if not path.exists():
+                    return f"Error: File {path} does not exist"
+
+                source_text = path.read_text()
+                pattern_text = arguments.get("search", "")
+                replacement = arguments.get("replace", "")
+                use_regex = arguments.get("regex", True)
+                max_replacements = arguments.get("max_replacements", 1)
+
+                if use_regex:
+                    try:
+                        pattern = re.compile(pattern_text)
+                    except re.error as exc:
+                        return f"Tool validation error: parameter 'search' invalid regex: {exc}"
+                    updated, count = pattern.subn(replacement, source_text, count=max_replacements)
+                else:
+                    if pattern_text not in source_text:
+                        count = 0
+                        updated = source_text
+                    else:
+                        updated = source_text.replace(pattern_text, replacement, max_replacements)
+                        count = source_text.count(pattern_text) if max_replacements <= 0 else min(source_text.count(pattern_text), max_replacements)
+
+                if count == 0:
+                    return "Tool validation error: edit_file replacement found no matches"
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(updated)
+                return f"Successfully edited {path} ({count} replacement{'s' if count != 1 else ''})"
+
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = arguments.get("mode", "write")
             content = arguments.get("content", "")
@@ -1049,7 +1132,6 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             return f"Successfully wrote to {path}"
 
         if name == "regex_search":
-            import re
             pattern = re.compile(arguments.get("pattern", ""))
             path = Path(arguments.get("path", ""))
             recursive = arguments.get("recursive", False)

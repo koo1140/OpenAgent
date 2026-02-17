@@ -12,6 +12,7 @@ from main import (
     parse_agent_action,
     parse_subagent_tag,
     parse_tool_tag,
+    resolve_tool_path,
     resolve_agent_config,
     run_tool_loop,
     run_v2_orchestrator,
@@ -41,6 +42,10 @@ def test_parse_subagent_tag_valid():
     assert parsed is not None
     assert parsed["task"] == "Collect data"
     assert parsed["tools"] == "read_file, regex_search"
+
+
+def test_resolve_tool_path_maps_identity_memory_file():
+    assert str(resolve_tool_path("identity.md")).replace("\\", "/").endswith("memory/identity.md")
 
 
 @pytest.mark.asyncio
@@ -167,16 +172,24 @@ async def test_execute_v2_tool_shell_needs_approval_in_ask_mode():
 
 
 @pytest.mark.asyncio
-async def test_execute_v2_tool_rejects_invalid_edit_file_shape():
+async def test_execute_v2_tool_accepts_legacy_edit_file_shape(tmp_path):
+    target = tmp_path / "identity.md"
+    target.write_text("Assistant Name: OldName")
+
     outcome = await execute_v2_tool(
         "edit_file",
-        {"file": "identity.md", "search": "x", "replace": "y"},
+        {
+            "file_path": str(target),
+            "search": "Assistant Name: .*",
+            "replace": "Assistant Name: OpenAgent",
+        },
         user_message="x",
         allow_shell=False,
     )
-    assert outcome["status"] == "rejected"
-    assert "Tool validation error" in outcome["message"]
-    assert outcome["terminal"] is True
+    assert outcome["status"] == "ok"
+    assert outcome["terminal"] is False
+    assert "Successfully edited" in outcome["message"]
+    assert target.read_text() == "Assistant Name: OpenAgent"
 
 
 @pytest.mark.asyncio
