@@ -1,0 +1,91 @@
+<svg width="900" height="720" viewBox="0 0 900 720" xmlns="http://www.w3.org/2000/svg">
+
+  <style>
+    .box {
+      fill: #0f172a;
+      stroke: #38bdf8;
+      stroke-width: 2;
+      rx: 14;
+    }
+    .text {
+      fill: #e2e8f0;
+      font-family: monospace;
+      font-size: 16px;
+      text-anchor: middle;
+      dominant-baseline: middle;
+    }
+    .label {
+      fill: #94a3b8;
+      font-family: monospace;
+      font-size: 13px;
+      text-anchor: middle;
+    }
+    .arrow {
+      stroke: #38bdf8;
+      stroke-width: 2;
+      marker-end: url(#arrowhead);
+    }
+    .title {
+      fill: #38bdf8;
+      font-family: monospace;
+      font-size: 22px;
+      text-anchor: middle;
+      font-weight: bold;
+    }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7"
+      refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#38bdf8"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="450" y="40" class="title">Unified Adaptive Execution Pipeline</text>
+
+  <!-- User Input -->
+  <text x="450" y="80" class="text">User Input</text>
+
+  <!-- Layer 1 -->
+  <rect x="200" y="110" width="500" height="60" class="box"/>
+  <text x="450" y="135" class="text">Layer 1: Meta-Analysis</text>
+  <text x="450" y="155" class="label">(Intent • Tone • User • Subject • Needs • Patterns)</text>
+
+  <!-- Layer 2 -->
+  <rect x="200" y="200" width="500" height="60" class="box"/>
+  <text x="450" y="225" class="text">Layer 2: System Planner</text>
+  <text x="450" y="245" class="label">(Strategy • Memory Actions • Sub-agent Tasks)</text>
+
+  <!-- Layer 3 -->
+  <rect x="200" y="290" width="500" height="60" class="box"/>
+  <text x="450" y="315" class="text">Layer 3: Main Agent</text>
+  <text x="450" y="335" class="label">(Tool Use • Context Integration • User Response)</text>
+
+  <!-- Layer 4 -->
+  <rect x="200" y="380" width="500" height="60" class="box"/>
+  <text x="450" y="405" class="text">Layer 4: Sub-Agents</text>
+  <text x="450" y="425" class="label">(Parallel Focused Tasks)</text>
+
+  <!-- Layer 5 -->
+  <rect x="200" y="470" width="500" height="60" class="box"/>
+  <text x="450" y="495" class="text">Layer 5: Gatekeeper</text>
+  <text x="450" y="515" class="label">(Turn Summary • Memory Evolution • Validation)</text>
+
+  <!-- User Response -->
+  <text x="450" y="570" class="text">User Response</text>
+
+  <!-- Arrows -->
+  <line x1="450" y1="90" x2="450" y2="110" class="arrow"/>
+  <line x1="450" y1="170" x2="450" y2="200" class="arrow"/>
+  <line x1="450" y1="260" x2="450" y2="290" class="arrow"/>
+  <line x1="450" y1="350" x2="450" y2="380" class="arrow"/>
+  <line x1="450" y1="440" x2="450" y2="470" class="arrow"/>
+  <line x1="450" y1="530" x2="450" y2="555" class="arrow"/>
+
+  <!-- Side execution modes -->
+  <text x="760" y="225" class="label">fast path</text>
+  <text x="760" y="315" class="label">standard path</text>
+  <text x="760" y="405" class="label">deep path</text>
+
+</svg>
