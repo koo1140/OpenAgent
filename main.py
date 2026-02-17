@@ -803,6 +803,196 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
 ]
 
 
+def tool_schema_by_name() -> Dict[str, Dict[str, Any]]:
+    schemas: Dict[str, Dict[str, Any]] = {}
+    for entry in TOOLS_SPEC:
+        fn = entry.get("function", {})
+        name = fn.get("name")
+        params = fn.get("parameters", {})
+        if isinstance(name, str):
+            schemas[name] = params if isinstance(params, dict) else {}
+    return schemas
+
+
+def coerce_tool_value(value: Any, schema: Dict[str, Any]) -> Tuple[Any, Optional[str]]:
+    expected_type = schema.get("type")
+    if expected_type == "string":
+        if isinstance(value, str):
+            return value, None
+        return str(value), None
+    if expected_type == "boolean":
+        if isinstance(value, bool):
+            return value, None
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes"}:
+                return True, None
+            if lowered in {"false", "0", "no"}:
+                return False, None
+        return None, "must be a boolean"
+    if expected_type == "integer":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, None
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+                return int(text), None
+        return None, "must be an integer"
+    if expected_type == "object":
+        if isinstance(value, dict):
+            return value, None
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed, None
+            except Exception:
+                pass
+        return None, "must be an object (JSON object string accepted)"
+    if expected_type == "array":
+        if isinstance(value, list):
+            return value, None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return [], None
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed, None
+            except Exception:
+                pass
+            # Best-effort fallback for comma-separated list.
+            return [part.strip() for part in raw.split(",") if part.strip()], None
+        return None, "must be an array (JSON array string accepted)"
+    return value, None
+
+
+def normalize_and_validate_tool_arguments(name: str, arguments: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    schemas = tool_schema_by_name()
+    if name not in schemas:
+        # Unknown tools are handled by execute_tool itself.
+        return arguments if isinstance(arguments, dict) else {}, None
+
+    params_schema = schemas.get(name, {}) or {}
+    props = params_schema.get("properties", {}) or {}
+    required = params_schema.get("required", []) or []
+    args = arguments if isinstance(arguments, dict) else {}
+
+    unknown = sorted([key for key in args.keys() if key not in props])
+    if unknown:
+        return None, f"unexpected parameter(s) for {name}: {', '.join(unknown)}"
+
+    normalized: Dict[str, Any] = {}
+    for key, schema in props.items():
+        if key not in args:
+            continue
+        coerced, err = coerce_tool_value(args.get(key), schema if isinstance(schema, dict) else {})
+        if err:
+            return None, f"parameter '{key}' {err}"
+        enum_values = (schema or {}).get("enum")
+        if enum_values and coerced not in enum_values:
+            return None, f"parameter '{key}' must be one of: {', '.join(map(str, enum_values))}"
+        normalized[key] = coerced
+
+    missing = [key for key in required if key not in normalized]
+    if missing:
+        return None, f"missing required parameter(s) for {name}: {', '.join(missing)}"
+
+    for key in required:
+        value = normalized.get(key)
+        if isinstance(value, str) and not value.strip():
+            return None, f"parameter '{key}' must be non-empty"
+
+    return normalized, None
+
+
+def create_artifact(
+    artifacts: List[Dict[str, Any]],
+    owner: str,
+    tool_name: str,
+    args: Dict[str, Any],
+    status: str,
+    content: str,
+) -> Dict[str, Any]:
+    artifact_id = f"artifact_{uuid.uuid4().hex[:12]}"
+    text = content if isinstance(content, str) else str(content)
+    artifact = {
+        "id": artifact_id,
+        "owner": owner,
+        "tool": tool_name,
+        "args": args,
+        "status": status,
+        "created_at": now_iso(),
+        "content": truncate(text, limit=8000),
+    }
+    artifacts.append(artifact)
+    return artifact
+
+
+def render_artifact_context(
+    artifacts: List[Dict[str, Any]],
+    artifact_ids: Optional[List[str]] = None,
+    max_items: int = 4,
+    max_chars_per_item: int = 2500,
+) -> str:
+    if not artifacts:
+        return ""
+    selected: List[Dict[str, Any]] = []
+    if artifact_ids:
+        wanted = set(artifact_ids)
+        selected = [artifact for artifact in artifacts if artifact.get("id") in wanted]
+    if not selected:
+        selected = artifacts[-max_items:]
+    selected = selected[:max_items]
+    blocks: List[str] = []
+    for artifact in selected:
+        art_id = artifact.get("id", "")
+        tool_name = artifact.get("tool", "")
+        status = artifact.get("status", "")
+        content = artifact.get("content", "")
+        blocks.append(
+            f"[{art_id}] tool={tool_name} status={status}\n{truncate(content, limit=max_chars_per_item)}"
+        )
+    return "\n\n".join(blocks)
+
+
+def parse_finish_payload(raw_result: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    text = (raw_result or "").strip()
+    if not text:
+        return None, "FINISH result is empty"
+
+    candidate = text
+    if not text.startswith("{"):
+        extracted = extract_json_candidate(text)
+        if extracted:
+            candidate = extracted
+    try:
+        payload = json.loads(candidate)
+    except Exception:
+        return None, "FINISH result must be valid JSON object string"
+
+    if not isinstance(payload, dict):
+        return None, "FINISH payload must be a JSON object"
+
+    summary = payload.get("summary")
+    critical_facts = payload.get("critical_facts", [])
+    artifact_ids = payload.get("artifact_ids", [])
+
+    if not isinstance(summary, str) or not summary.strip():
+        return None, "FINISH payload missing non-empty 'summary'"
+    if not isinstance(critical_facts, list) or any(not isinstance(item, str) for item in critical_facts):
+        return None, "FINISH payload 'critical_facts' must be a list of strings"
+    if not isinstance(artifact_ids, list) or any(not isinstance(item, str) for item in artifact_ids):
+        return None, "FINISH payload 'artifact_ids' must be a list of strings"
+
+    return {
+        "summary": summary.strip(),
+        "critical_facts": [item.strip() for item in critical_facts if item.strip()],
+        "artifact_ids": [item.strip() for item in artifact_ids if item.strip()],
+    }, None
+
+
 def filter_tools(allowed: Optional[List[str]]) -> List[Dict[str, Any]]:
     if not allowed:
         return []
@@ -812,6 +1002,11 @@ def filter_tools(allowed: Optional[List[str]]) -> List[Dict[str, Any]]:
 
 async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     try:
+        normalized_args, validation_error = normalize_and_validate_tool_arguments(name, arguments)
+        if validation_error:
+            return f"Tool validation error: {validation_error}"
+        arguments = normalized_args or {}
+
         if name == "shell_command":
             proc = await asyncio.create_subprocess_shell(
                 arguments.get("command", ""),
@@ -823,16 +1018,26 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             return f"STDOUT:\n{stdout.decode()}\nSTDERR:\n{stderr.decode()}"
 
         if name == "read_file":
-            path = Path(arguments.get("path", ""))
+            raw_path = (arguments.get("path") or "").strip()
+            if not raw_path:
+                return "Tool validation error: read_file requires non-empty 'path'"
+            path = Path(raw_path)
             if not path.exists():
                 return f"Error: File {path} does not exist"
+            if path.is_dir():
+                return f"Tool validation error: read_file path '{path}' is a directory; pass a file path"
             lines = path.read_text().splitlines()
             if len(lines) <= 200:
                 return "\n".join(lines)
             return "\n".join(lines[:60]) + f"\n... (truncated, {len(lines)} total lines)"
 
         if name == "edit_file":
-            path = Path(arguments.get("path", ""))
+            raw_path = (arguments.get("path") or "").strip()
+            if not raw_path:
+                return "Tool validation error: edit_file requires non-empty 'path'"
+            path = Path(raw_path)
+            if path.exists() and path.is_dir():
+                return f"Tool validation error: edit_file path '{path}' is a directory; pass a file path"
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = arguments.get("mode", "write")
             content = arguments.get("content", "")
@@ -2011,6 +2216,17 @@ async def execute_v2_tool(
 ) -> Dict[str, Any]:
     del user_message
     del allow_shell
+
+    normalized_args, validation_error = normalize_and_validate_tool_arguments(name, arguments)
+    if validation_error:
+        return tool_outcome(
+            "rejected",
+            f"Tool validation error: {validation_error}",
+            terminal=True,
+            retryable=False,
+        )
+    arguments = normalized_args or {}
+
     if name == "FINISH":
         return tool_outcome("ok", "FINISH intercepted.", terminal=False, retryable=False)
 
@@ -2042,6 +2258,8 @@ async def execute_v2_tool(
         )
 
     result = await execute_tool(name, arguments)
+    if result.startswith("Tool validation error:"):
+        return tool_outcome("rejected", result, terminal=True, retryable=False)
     if result.startswith("Unknown tool:"):
         return tool_outcome("unknown_tool", result, terminal=True, retryable=False)
     if result.startswith("Tool execution error"):
@@ -2085,6 +2303,7 @@ def format_tool_events_for_response(tool_events: List[Dict[str, Any]]) -> List[D
             "status": ev.get("status", "ok"),
             "result": truncate(ev.get("result", "")),
             "created_at": ev.get("created_at"),
+            "artifact_id": ev.get("artifact_id"),
         }
         for ev in tool_events
     ]
@@ -2144,6 +2363,8 @@ async def run_v2_subagent(
             "action_failures": {},
             "round": 0,
             "pending_tool": None,
+            "artifacts": [],
+            "finish_payload": None,
         }
     else:
         task = state.get("task", task)
@@ -2158,6 +2379,7 @@ async def run_v2_subagent(
     action_attempts = state["action_attempts"]
     action_failures = state["action_failures"]
     allowed_tools = state["allowed_tools"]
+    artifacts = state["artifacts"]
 
     def finish_result(result_text: str) -> Dict[str, Any]:
         return {
@@ -2168,6 +2390,8 @@ async def run_v2_subagent(
             "output": result_text,
             "tool_events": tool_events,
             "warnings": warnings,
+            "artifacts": artifacts,
+            "finish_payload": state.get("finish_payload"),
         }
 
     async def apply_outcome(tool_name: str, args: Dict[str, Any], outcome: Dict[str, Any], signature: str) -> Optional[Dict[str, Any]]:
@@ -2182,6 +2406,15 @@ async def run_v2_subagent(
         if terminal and status in {"rejected", "denied"}:
             event_status = f"terminal_{status}"
 
+        artifact = create_artifact(
+            artifacts,
+            owner="subagent",
+            tool_name=tool_name,
+            args=args,
+            status=event_status,
+            content=result,
+        )
+
         if queue_event:
             await queue_event("tool_result", {"name": tool_name, "status": event_status, "result": truncate(result)})
         tool_events.append({
@@ -2189,9 +2422,16 @@ async def run_v2_subagent(
             "args": args,
             "status": event_status,
             "result": truncate(result),
+            "artifact_id": artifact.get("id"),
         })
         partial_notes.append(f"{tool_name}:{event_status}")
-        messages.append({"role": "system", "content": f"Tool result ({tool_name}, {event_status}):\n{result}"})
+        messages.append({
+            "role": "system",
+            "content": (
+                f"Tool result ({tool_name}, {event_status}):\n{result}\n"
+                f"Artifact ID: {artifact.get('id')}"
+            ),
+        })
 
         if terminal:
             warnings.append(f"terminal failure on '{tool_name}' ({status})")
@@ -2281,7 +2521,15 @@ async def run_v2_subagent(
         tool_name = parsed["tool_name"]
         args = parsed["params"]
         if tool_name == "FINISH":
-            result_text = args.get("result", "").strip()
+            payload, payload_error = parse_finish_payload(args.get("result", ""))
+            if payload_error:
+                warnings.append(f"invalid FINISH payload: {payload_error}")
+                return finish_result(f"Sub-agent auto-finish: invalid FINISH payload ({payload_error}).")
+            missing = [art_id for art_id in payload.get("artifact_ids", []) if not any(a.get("id") == art_id for a in artifacts)]
+            if missing:
+                warnings.append(f"FINISH referenced missing artifact ids: {', '.join(missing)}")
+            state["finish_payload"] = payload
+            result_text = payload.get("summary", "").strip()
             return finish_result(result_text)
 
         signature = normalize_action_signature("tool", tool_name, args)
@@ -2351,6 +2599,8 @@ async def run_v2_orchestrator(
             "round": 0,
             "pending_tool": None,
             "pending_subagent": None,
+            "artifacts": [],
+            "finish_payload": None,
         }
     else:
         tasks = state.get("tasks", tasks)
@@ -2365,6 +2615,7 @@ async def run_v2_orchestrator(
     action_attempts = state["action_attempts"]
     action_failures = state["action_failures"]
     allowed_tool_names = state["allowed_tool_names"]
+    artifacts = state["artifacts"]
 
     def finish_result(result_text: str) -> Dict[str, Any]:
         return {
@@ -2373,6 +2624,8 @@ async def run_v2_orchestrator(
             "tool_events": tool_events,
             "subagent_outputs": subagent_outputs,
             "warnings": warnings,
+            "artifacts": artifacts,
+            "finish_payload": state.get("finish_payload"),
         }
 
     async def apply_outcome(tool_name: str, args: Dict[str, Any], outcome: Dict[str, Any], signature: str) -> Optional[Dict[str, Any]]:
@@ -2387,6 +2640,15 @@ async def run_v2_orchestrator(
         if terminal and status in {"rejected", "denied"}:
             event_status = f"terminal_{status}"
 
+        artifact = create_artifact(
+            artifacts,
+            owner="orchestrator",
+            tool_name=tool_name,
+            args=args,
+            status=event_status,
+            content=result,
+        )
+
         if queue_event:
             await queue_event("tool_result", {"name": tool_name, "status": event_status, "result": truncate(result)})
         tool_events.append({
@@ -2396,8 +2658,15 @@ async def run_v2_orchestrator(
             "status": event_status,
             "result": result,
             "created_at": now_iso(),
+            "artifact_id": artifact.get("id"),
         })
-        messages.append({"role": "system", "content": f"Tool result ({tool_name}, {event_status}):\n{result}"})
+        messages.append({
+            "role": "system",
+            "content": (
+                f"Tool result ({tool_name}, {event_status}):\n{result}\n"
+                f"Artifact ID: {artifact.get('id')}"
+            ),
+        })
 
         if terminal:
             warnings.append(f"terminal failure on '{tool_name}' ({status})")
@@ -2471,6 +2740,9 @@ async def run_v2_orchestrator(
                 }
 
             subagent_outputs.append(sub_result)
+            for artifact in sub_result.get("artifacts", []):
+                if isinstance(artifact, dict):
+                    artifacts.append(artifact)
             if queue_event:
                 await queue_event("subagent", sub_result)
             if sub_result.get("warnings"):
@@ -2522,6 +2794,8 @@ async def run_v2_orchestrator(
                     "output": "Sub-agent auto-finish: no valid tools after sanitization.",
                     "tool_events": [],
                     "warnings": ["no valid tools after sanitization"],
+                    "artifacts": [],
+                    "finish_payload": None,
                 }
                 subagent_outputs.append(sub_result)
                 if queue_event:
@@ -2557,6 +2831,9 @@ async def run_v2_orchestrator(
                 }
 
             subagent_outputs.append(sub_result)
+            for artifact in sub_result.get("artifacts", []):
+                if isinstance(artifact, dict):
+                    artifacts.append(artifact)
             if queue_event:
                 await queue_event("subagent", sub_result)
             if sub_result.get("warnings"):
@@ -2571,7 +2848,15 @@ async def run_v2_orchestrator(
             tool_name = parsed["tool_name"]
             args = parsed["params"]
             if tool_name == "FINISH":
-                final_result = args.get("result", "").strip()
+                payload, payload_error = parse_finish_payload(args.get("result", ""))
+                if payload_error:
+                    warnings.append(f"invalid FINISH payload: {payload_error}")
+                    return finish_result(f"Orchestrator auto-finish: invalid FINISH payload ({payload_error}).")
+                missing = [art_id for art_id in payload.get("artifact_ids", []) if not any(a.get("id") == art_id for a in artifacts)]
+                if missing:
+                    warnings.append(f"FINISH referenced missing artifact ids: {', '.join(missing)}")
+                state["finish_payload"] = payload
+                final_result = payload.get("summary", "").strip()
                 return finish_result(final_result)
 
             signature = normalize_action_signature("tool", tool_name, args)
@@ -2657,6 +2942,8 @@ async def run_v2_pipeline(
             "force_direct_finalization": False,
             "round": 0,
             "pending_orchestrator": None,
+            "artifacts": [],
+            "orchestrator_finish_payload": None,
         }
     else:
         request = ChatRequest(message=state.get("request_message", request.message), session_id=session_id)
@@ -2666,6 +2953,7 @@ async def run_v2_pipeline(
     subagent_outputs = state["subagent_outputs"]
     summaries = state["summaries"]
     warnings = state["warnings"]
+    artifacts = state["artifacts"]
 
     def build_meta() -> Dict[str, Any]:
         return {
@@ -2673,6 +2961,16 @@ async def run_v2_pipeline(
             "warnings": warnings,
             "summaries": summaries,
             "orchestrator_result": state["orchestrator_result"],
+            "orchestrator_finish_payload": state.get("orchestrator_finish_payload"),
+            "artifact_index": [
+                {
+                    "id": artifact.get("id"),
+                    "owner": artifact.get("owner"),
+                    "tool": artifact.get("tool"),
+                    "status": artifact.get("status"),
+                }
+                for artifact in artifacts
+            ],
         }
 
     def response_payload(reply: str, status: str = "ok", pending_tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -2731,7 +3029,23 @@ async def run_v2_pipeline(
             tool_events.extend(orchestrator_output.get("tool_events", []))
             subagent_outputs.extend(orchestrator_output.get("subagent_outputs", []))
             warnings.extend(orchestrator_output.get("warnings", []))
+            artifacts.extend(orchestrator_output.get("artifacts", []))
+            state["orchestrator_finish_payload"] = orchestrator_output.get("finish_payload")
             messages.append({"role": "system", "content": f"Orchestrator result:\n{state['orchestrator_result']}"})
+            finish_payload = orchestrator_output.get("finish_payload") or {}
+            facts = finish_payload.get("critical_facts", []) if isinstance(finish_payload, dict) else []
+            if facts:
+                messages.append({
+                    "role": "system",
+                    "content": "Orchestrator critical facts:\n" + "\n".join([f"- {fact}" for fact in facts]),
+                })
+            artifact_ids = finish_payload.get("artifact_ids", []) if isinstance(finish_payload, dict) else []
+            artifact_context = render_artifact_context(orchestrator_output.get("artifacts", []), artifact_ids=artifact_ids)
+            if artifact_context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Referenced artifacts from orchestrator:\n{artifact_context}",
+                })
             messages.append({
                 "role": "system",
                 "content": (
@@ -2837,7 +3151,23 @@ async def run_v2_pipeline(
             tool_events.extend(orchestrator_output.get("tool_events", []))
             subagent_outputs.extend(orchestrator_output.get("subagent_outputs", []))
             warnings.extend(orchestrator_output.get("warnings", []))
+            artifacts.extend(orchestrator_output.get("artifacts", []))
+            state["orchestrator_finish_payload"] = orchestrator_output.get("finish_payload")
             messages.append({"role": "system", "content": f"Orchestrator result:\n{state['orchestrator_result']}"})
+            finish_payload = orchestrator_output.get("finish_payload") or {}
+            facts = finish_payload.get("critical_facts", []) if isinstance(finish_payload, dict) else []
+            if facts:
+                messages.append({
+                    "role": "system",
+                    "content": "Orchestrator critical facts:\n" + "\n".join([f"- {fact}" for fact in facts]),
+                })
+            artifact_ids = finish_payload.get("artifact_ids", []) if isinstance(finish_payload, dict) else []
+            artifact_context = render_artifact_context(orchestrator_output.get("artifacts", []), artifact_ids=artifact_ids)
+            if artifact_context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Referenced artifacts from orchestrator:\n{artifact_context}",
+                })
             messages.append({
                 "role": "system",
                 "content": (

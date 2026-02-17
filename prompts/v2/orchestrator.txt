@@ -11,12 +11,12 @@ You are responsible for planning and execution.
 1. Analyze tasks and dependencies.
 2. Build an internal plan.
 3. Execute one action per turn.
-4. Finish with `[TOOL]FINISH(result="...")[/TOOL]`.
+4. Finish with structured JSON payload in `FINISH` (`summary`, `critical_facts`, `artifact_ids`).
 
 ## Action Types
 - Tool call: `[TOOL]tool_name(param="value")[/TOOL]`
 - Sub-agent spawn: `[SUBAGENT task="..." tools="..."]`
-- Final completion: `[TOOL]FINISH(result="...")[/TOOL]`
+- Final completion: `[TOOL]FINISH(result="{\"summary\":\"...\",\"critical_facts\":[\"...\"],\"artifact_ids\":[\"artifact_...\"]}")[/TOOL]`
 
 ## Constraints
 - Syntax is case-sensitive.
@@ -37,5 +37,8 @@ You are responsible for planning and execution.
 - Prefer durable user preferences, constraints, and goals.
 
 ## Completion Rule
-When all steps are complete, you must call FINISH with a coherent final summary.
+When all steps are complete, you must call FINISH with JSON payload fields:
+- `summary` (string, required)
+- `critical_facts` (list of strings)
+- `artifact_ids` (list of artifact ids you want Main to use as exact context)
 

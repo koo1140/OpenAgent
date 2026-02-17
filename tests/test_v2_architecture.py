@@ -167,6 +167,32 @@ async def test_execute_v2_tool_shell_needs_approval_in_ask_mode():
 
 
 @pytest.mark.asyncio
+async def test_execute_v2_tool_rejects_invalid_edit_file_shape():
+    outcome = await execute_v2_tool(
+        "edit_file",
+        {"file": "identity.md", "search": "x", "replace": "y"},
+        user_message="x",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "rejected"
+    assert "Tool validation error" in outcome["message"]
+    assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_read_file_directory_path_rejected():
+    outcome = await execute_v2_tool(
+        "read_file",
+        {"path": "."},
+        user_message="x",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "rejected"
+    assert "is a directory" in outcome["message"]
+    assert outcome["terminal"] is True
+
+
+@pytest.mark.asyncio
 async def test_execute_v2_tool_unknown_tool_classified(monkeypatch):
     async def fake_execute_tool(name, arguments):
         return "Unknown tool: mystery"
@@ -186,7 +212,7 @@ async def test_execute_v2_tool_unknown_tool_classified(monkeypatch):
 async def test_orchestrator_shell_approval_pause_and_resume(monkeypatch):
     responses = [
         {"choices": [{"message": {"content": '[TOOL]shell_command(command="echo hi")[/TOOL]'}}]},
-        {"choices": [{"message": {"content": '[TOOL]FINISH(result="done")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]FINISH(result="{\\"summary\\":\\"done\\",\\"critical_facts\\":[],\\"artifact_ids\\":[] }")[/TOOL]'}}]},
     ]
 
     async def fake_call(*args, **kwargs):
@@ -221,6 +247,26 @@ async def test_orchestrator_shell_approval_pause_and_resume(monkeypatch):
     assert resumed["status"] == "ok"
     assert resumed["result"] == "done"
     assert resumed["tool_events"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_finish_requires_structured_payload(monkeypatch):
+    responses = [
+        {"choices": [{"message": {"content": '[TOOL]FINISH(result="done")[/TOOL]'}}]},
+    ]
+
+    async def fake_call(*args, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr("main.LLMProvider.call", fake_call)
+    result = await run_v2_orchestrator(
+        tasks="1. finish",
+        context="",
+        user_message="u",
+        allow_shell=False,
+    )
+    assert "invalid FINISH payload" in result["result"]
+    assert any("invalid FINISH payload" in w for w in result["warnings"])
 
 
 @pytest.mark.asyncio
@@ -363,7 +409,7 @@ async def test_v2_pipeline_shell_pause_and_resume(monkeypatch):
     responses = [
         {"choices": [{"message": {"content": '[TOOL]orchestrator(tasks="1. run shell", context="")[/TOOL]'}}]},
         {"choices": [{"message": {"content": '[TOOL]shell_command(command="echo hi")[/TOOL]'}}]},
-        {"choices": [{"message": {"content": '[TOOL]FINISH(result="orchestrator done")[/TOOL]'}}]},
+        {"choices": [{"message": {"content": '[TOOL]FINISH(result="{\\"summary\\":\\"orchestrator done\\",\\"critical_facts\\":[\\"shell returned hi\\"],\\"artifact_ids\\":[] }")[/TOOL]'}}]},
         {"choices": [{"message": {"content": "Final user reply"}}]},
     ]
 
