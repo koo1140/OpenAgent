@@ -89,14 +89,13 @@ async def test_parse_agent_action_unrecoverable_nonfatal(monkeypatch):
     assert parsed["type"] == "invalid"
 
 
-def test_resolve_agent_config_legacy_back_compat_mapping():
-    legacy_cfg = AgentConfig(
+def test_resolve_agent_config_provider_fallback_mapping():
+    cfg = AgentConfig(
         main=ProviderConfig(provider="OpenAI", model="m", api_key="k"),
         sub=ProviderConfig(provider="OpenAI", model="s", api_key="k"),
         meta=ProviderConfig(provider="OpenAI", model="meta", api_key="k"),
     )
-    resolved = resolve_agent_config(legacy_cfg)
-    assert resolved.architecture_mode == "legacy"
+    resolved = resolve_agent_config(cfg)
     assert resolved.orchestrator is not None
     assert resolved.summarizer is not None
 

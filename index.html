@@ -1052,15 +1052,6 @@ input[type="checkbox"] {
   </header>
   <div class="settings">
     <div class="agent-card">
-      <div class="agent-title">Architecture Mode</div>
-      <label>Mode</label>
-      <select id="architecture_mode">
-        <option value="legacy">legacy</option>
-        <option value="hierarchical_v2">hierarchical_v2</option>
-      </select>
-    </div>
-
-    <div class="agent-card">
       <div class="agent-title">Meta Agent</div>
       <label>Provider</label>
       <select id="meta_provider"></select>
@@ -1199,7 +1190,6 @@ let progressCurrent = 0;
 let progressTarget = 0;
 let progressRaf = null;
 let progressTicker = null;
-let currentArchitectureMode = "legacy";
 
 function renderProgress(){
   progressBarFill.style.width = progressCurrent.toFixed(1) + "%";
@@ -1683,26 +1673,16 @@ function handleSSEChunk(chunk){
 }
 
 function handleSSEEvent(eventType, payload){
-  if(payload && payload.architecture_mode){
-    currentArchitectureMode = payload.architecture_mode;
-  }
   if(eventType === "stage"){
     const name = payload.name || "";
-    const map = currentArchitectureMode === "hierarchical_v2"
-      ? {
-          "main_thinking": ["Main Agent...", 12],
-          "summarizer": ["Summarizer...", 30],
-          "orchestrator": ["Orchestrator...", 45],
-          "subagent": ["Sub-Agent...", 65],
-          "finish": ["Finalizing...", 90]
-        }
-      : {
-          "meta_start": ["Meta + Planner...", 8],
-          "planning_start": ["System Planner...", 30],
-          "gatekeeper_start": ["Gatekeeper...", 90],
-          "subagents_start": ["Subagents...", 50],
-          "tools_start": ["Tools...", 70]
-        };
+    const map = {
+      "meta": ["Meta analysis...", 10],
+      "planner": ["Planning...", 30],
+      "executor": ["Executing...", 60],
+      "orchestrator": ["Orchestrating...", 78],
+      "gatekeeper": ["Validating...", 90],
+      "finish": ["Finalizing...", 95]
+    };
     const [msg, percent] = map[name] || [name, 0];
     showProgress(msg, percent);
     return;
@@ -1881,8 +1861,6 @@ async function loadConfig(){
     const res = await fetch("/api/config");
     if(!res.ok) return;
     const data = await res.json();
-    currentArchitectureMode = data.architecture_mode || "legacy";
-    document.getElementById("architecture_mode").value = currentArchitectureMode;
     fillProviderFields("meta", data.meta || {});
     fillProviderFields("main", data.main || {});
     fillProviderFields("sub", data.sub || {});
@@ -1911,9 +1889,7 @@ function buildProviderPayload(prefix){
 
 async function saveConfig(){
   try{
-    currentArchitectureMode = document.getElementById("architecture_mode").value || "legacy";
     const payload = {
-      architecture_mode: currentArchitectureMode,
       meta: buildProviderPayload("meta"),
       main: buildProviderPayload("main"),
       sub: buildProviderPayload("sub"),

@@ -23,6 +23,7 @@ For FINISH, `summary` is required. `critical_facts` and `artifact_ids` should in
 Tool notes:
 - `memory_create`: use `content` (+ optional `category`, `tags`).
 - `edit_file`: prefer `search`/`replace` for existing files; avoid full overwrite of memory markdown files.
+- `read_file`: for large files, use `mode=\"structure\"`, `mode=\"window\"`, or `mode=\"tail\"`.
 
 ## Behavior
 - Do not chat with the user.

@@ -1,3 +1,7 @@
+<!-- SUMMARY_START -->
+Preview: # USER PROFILE | *This file is automatically updated by the Meta Agent based on observations and interactions* | ## Last Updated
+<!-- SUMMARY_END -->
+
 # USER PROFILE
 
 *This file is automatically updated by the Meta Agent based on observations and interactions*

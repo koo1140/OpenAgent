@@ -68,6 +68,7 @@ Use `read_file` when needed:
 - `memory/soul.md`
 - `memory/user.md`
 - `skills/<skill_name>.md`
+For large files, prefer `read_file` with `mode="structure"`, `mode="window"`, or `mode="tail"`.
 
 ## TOOLS YOU HAVE
 

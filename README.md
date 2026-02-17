@@ -6,17 +6,13 @@ A sophisticated multi-agent LLM orchestration system with meta-cognitive capabil
 
 ## Overview
 
-This system implements dual architecture modes:
+This system uses a unified adaptive pipeline with three execution paths:
 
-- `legacy` (existing five-layer pipeline)
-- `hierarchical_v2` (Main -> Summarizer optional -> Orchestrator -> Sub-Agent strict syntax)
+- `fast` for low-complexity turns
+- `standard` for normal multi-step turns
+- `deep` for complex turns and sub-agent orchestration
 
-`hierarchical_v2` includes loop guards:
-- Terminal tool outcomes (`rejected`, `denied`, `unknown_tool`) stop repeated retries.
-- Repeated failing actions are auto-finished with partial results and warnings.
-- Main finalizes directly after orchestrator completion to avoid recursive orchestrator calls.
-
-The legacy mode uses a sophisticated five-layer architecture:
+The adaptive runtime keeps the same five conceptual layers:
 
 1. **Layer 1: Meta-Analysis** - Observational consciousness analyzing intent, tone, and patterns across 6 dimensions.
 2. **Layer 2: System Planner** - Strategic layer that processes meta-analysis to decide on memory loading, tool strategies, and sub-agent deployment.
@@ -57,7 +53,7 @@ Supports OpenAI-compatible APIs plus Anthropic:
 ### 🛠️ Powerful Tool System
 Built-in tools for real work:
 - **shell_command** - Execute system commands
-- **read_file** - Read files (smart truncation for large files)
+- **read_file** - Read files with smart windowing (`smart`, `window`, `tail`, `structure`, `full`)
 - **edit_file** - Create/modify files
 - **regex_search** - Search text in files and directories
 - **curl_request** - HTTP requests with full control
@@ -154,7 +150,6 @@ python main.py
 Example configuration:
 ```json
 {
-  "architecture_mode": "legacy",
   "meta": {
     "provider": "Groq",
     "provider_type": "openai_compatible",
@@ -508,7 +503,7 @@ Returns:
   "status": "ok | needs_approval",
   "pending_tools": [...],
   "session_id": "uuid",
-  "architecture_mode": "legacy | hierarchical_v2"
+  "execution_path": "fast | standard | deep"
 }
 ```
 

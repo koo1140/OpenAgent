@@ -17,6 +17,14 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from engine.adaptive_router import AdaptiveRouter
+from engine.context_bus import ContextBus
+from engine.execution_engine import ExecutionDependencies, ExecutionEngine
+from engine.file_reader import WindowedFileReader
+from engine.memory_loader import MemoryContext
+from middleware.observability import PipelineTracker, TokenCounter
+from schemas.meta_analysis import MetaAnalysis, MetaAnalysisParser, SubAgentSpec
+
 app = FastAPI()
 
 # Configure logging
@@ -172,7 +180,6 @@ class ProviderConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    architecture_mode: Literal["legacy", "hierarchical_v2"] = "legacy"
     meta: Optional[ProviderConfig] = None
     main: ProviderConfig
     sub: ProviderConfig
@@ -226,7 +233,7 @@ class ChatResponse(BaseModel):
     status: str = "ok"
     pending_tools: Optional[List[Dict[str, Any]]] = None
     session_id: Optional[str] = None
-    architecture_mode: Literal["legacy", "hierarchical_v2"] = "legacy"
+    execution_path: Literal["fast", "standard", "deep"] = "standard"
 
 
 class SessionCreateRequest(BaseModel):
@@ -252,6 +259,9 @@ pending_approvals: Dict[str, Dict[str, Any]] = {}
 rate_limit_decisions: Dict[str, asyncio.Queue] = {}
 session_policies: Dict[str, Dict[str, Any]] = {}
 temp_sessions: Dict[str, Dict[str, Any]] = {}
+adaptive_router = AdaptiveRouter()
+execution_engine = ExecutionEngine()
+windowed_file_reader = WindowedFileReader()
 
 MEMORY_DIR.mkdir(exist_ok=True)
 SKILLS_DIR.mkdir(exist_ok=True)
@@ -260,6 +270,13 @@ if not PERSISTENT_MEMORY_PATH.exists():
     PERSISTENT_MEMORY_PATH.write_text(json.dumps({"memories": []}, indent=2))
 if not SKILLS_INDEX_PATH.exists():
     SKILLS_INDEX_PATH.write_text(json.dumps({"skills": []}, indent=2))
+
+try:
+    from scripts.migrate_v3 import run as run_migrate_v3
+
+    run_migrate_v3()
+except Exception as exc:
+    logger.warning(f"v3 migration skipped: {exc}")
 
 
 # =============================================================================
@@ -299,6 +316,8 @@ def init_db() -> None:
             tool_json TEXT,
             subagent_json TEXT,
             architecture_mode TEXT,
+            execution_path TEXT,
+            metrics_json TEXT,
             created_at TEXT,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )
@@ -328,6 +347,14 @@ def init_db() -> None:
         pass # Already exists
     try:
         cur.execute("ALTER TABLE turns ADD COLUMN architecture_mode TEXT")
+    except sqlite3.OperationalError:
+        pass # Already exists
+    try:
+        cur.execute("ALTER TABLE turns ADD COLUMN execution_path TEXT")
+    except sqlite3.OperationalError:
+        pass # Already exists
+    try:
+        cur.execute("ALTER TABLE turns ADD COLUMN metrics_json TEXT")
     except sqlite3.OperationalError:
         pass # Already exists
 
@@ -362,9 +389,6 @@ def resolve_agent_config(agent_cfg: AgentConfig) -> AgentConfig:
     resolved_orchestrator = resolve_provider_config(agent_cfg.orchestrator) if agent_cfg.orchestrator else None
     resolved_summarizer = resolve_provider_config(agent_cfg.summarizer) if agent_cfg.summarizer else None
 
-    # Backward-compatible defaults:
-    # - legacy mode relies on meta/main/sub
-    # - hierarchical_v2 can fall back to existing fields if not explicitly set
     if resolved_meta is None:
         resolved_meta = resolved_orchestrator or resolved_main
     if resolved_orchestrator is None:
@@ -373,7 +397,6 @@ def resolve_agent_config(agent_cfg: AgentConfig) -> AgentConfig:
         resolved_summarizer = resolved_meta or resolved_main
 
     return AgentConfig(
-        architecture_mode=agent_cfg.architecture_mode,
         meta=resolved_meta,
         main=resolved_main,
         sub=resolved_sub,
@@ -386,7 +409,7 @@ def load_config() -> Optional[AgentConfig]:
     if not CONFIG_PATH.exists():
         return None
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
         loaded = AgentConfig(**data)
         return resolve_agent_config(loaded)
     except Exception as exc:
@@ -399,12 +422,6 @@ if config:
     print("✅ Loaded agent config from config.json")
 else:
     print("⚠ No config.json found, you need to POST /api/config at least once")
-
-
-def get_architecture_mode() -> Literal["legacy", "hierarchical_v2"]:
-    if not config:
-        return "legacy"
-    return config.architecture_mode
 
 
 def get_orchestrator_cfg() -> ProviderConfig:
@@ -651,13 +668,20 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file. Returns full content if <200 lines, otherwise first 60 lines",
+            "description": "Read files with smart windowing. Supports smart/window/tail/structure/full modes.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to read"},
                     "file_path": {"type": "string", "description": "Alias for path"},
                     "file": {"type": "string", "description": "Alias for path"},
+                    "start_line": {"type": "integer", "description": "0-based start line for window mode"},
+                    "end_line": {"type": "integer", "description": "0-based exclusive end line for window mode"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["smart", "window", "tail", "structure", "full"],
+                        "description": "Read strategy; smart auto-selects",
+                    },
                 },
                 "required": ["path"],
             },
@@ -1115,14 +1139,16 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             if not raw_path:
                 return "Tool validation error: read_file requires non-empty 'path'"
             path = resolve_tool_path(raw_path)
-            if not path.exists():
-                return f"Error: File {path} does not exist"
-            if path.is_dir():
-                return f"Tool validation error: read_file path '{path}' is a directory; pass a file path"
-            lines = path.read_text().splitlines()
-            if len(lines) <= 200:
-                return "\n".join(lines)
-            return "\n".join(lines[:60]) + f"\n... (truncated, {len(lines)} total lines)"
+            mode = arguments.get("mode", "smart")
+            start_line = arguments.get("start_line", 0)
+            end_line = arguments.get("end_line")
+            result = windowed_file_reader.read(
+                path=str(path),
+                start_line=int(start_line or 0),
+                end_line=(int(end_line) if end_line is not None else None),
+                mode=str(mode or "smart"),
+            )
+            return windowed_file_reader.render(result)
 
         if name == "edit_file":
             raw_path = (arguments.get("path") or "").strip()
@@ -1597,7 +1623,7 @@ def get_session_turns(session_id: str) -> List[Dict[str, Any]]:
             "meta": json.loads(row["meta_json"] or "{}"),
             "tool_events": tool_events,
             "subagent_outputs": json.loads(row["subagent_json"] or "[]"),
-            "architecture_mode": row["architecture_mode"] or "legacy",
+            "execution_path": row["execution_path"] or "standard",
             "created_at": row["created_at"],
         })
     conn.close()
@@ -1688,7 +1714,9 @@ def store_turn(
     meta_json: Dict[str, Any],
     tool_events: List[Dict[str, Any]],
     subagent_outputs: List[Dict[str, Any]],
-    architecture_mode: str = "legacy",
+    execution_path: str = "standard",
+    metrics_json: Optional[Dict[str, Any]] = None,
+    architecture_mode: Optional[str] = None,
 ) -> None:
     canonical_reply = content_to_text(assistant_reply)
     if not persistent:
@@ -1708,7 +1736,8 @@ def store_turn(
                 for ev in tool_events
             ],
             "subagent_outputs": subagent_outputs,
-            "architecture_mode": architecture_mode,
+            "execution_path": execution_path,
+            "metrics": metrics_json or {},
             "created_at": now_iso(),
         })
         temp_sessions[session_id]["updated_at"] = now_iso()
@@ -1718,8 +1747,11 @@ def store_turn(
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO turns (session_id, user_message, assistant_reply, meta_json, tool_json, subagent_json, architecture_mode, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (
+            session_id, user_message, assistant_reply, meta_json, tool_json, subagent_json,
+            architecture_mode, execution_path, metrics_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -1729,6 +1761,8 @@ def store_turn(
             json.dumps([]),
             json.dumps(subagent_outputs),
             architecture_mode,
+            execution_path,
+            json.dumps(metrics_json or {}),
             now_iso(),
         ),
     )
@@ -3495,7 +3529,7 @@ async def run_legacy_pipeline(request: ChatRequest, session_id: str, persistent:
             status="needs_approval",
             pending_tools=pending_tools,
             session_id=session_id,
-            architecture_mode="legacy",
+            execution_path="standard",
         )
 
     reply = loop_result.get("content", "")
@@ -3536,8 +3570,441 @@ async def run_legacy_pipeline(request: ChatRequest, session_id: str, persistent:
         subagent_outputs=subagent_outputs,
         status="ok",
         session_id=session_id,
-        architecture_mode="legacy",
+        execution_path="standard",
     )
+
+
+def get_model_for_agent(agent_type: str) -> str:
+    if not config:
+        return "unknown"
+    if agent_type in {"meta", "planner"}:
+        cfg = config.meta or config.main
+    elif agent_type in {"main", "executor"}:
+        cfg = config.main
+    elif agent_type == "orchestrator":
+        cfg = config.orchestrator or config.main
+    elif agent_type in {"sub", "subagent"}:
+        cfg = config.sub
+    else:
+        cfg = config.main
+    return cfg.model
+
+
+def _meta_output_from_analysis(analysis: MetaAnalysis, plan: Optional[dict[str, Any]] = None) -> MetaOutput:
+    memory_actions = [
+        {"type": "append", "file": "user.md", "content": action, "reason": "meta-analysis"}
+        for action in analysis.memory_actions
+    ]
+    return MetaOutput(
+        user_intent=analysis.user_intent,
+        chat_subject=analysis.chat_subject,
+        user_tone=analysis.user_tone.value,
+        recommended_plan="; ".join(analysis.plan),
+        memory_actions=memory_actions,
+        plan=plan or {"steps": analysis.plan},
+    )
+
+
+def _format_pending_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": tc.get("id"),
+            "name": tc.get("function", {}).get("name"),
+            "arguments": tc.get("function", {}).get("arguments", "{}"),
+        }
+        for tc in tool_calls
+    ]
+
+
+def _execution_path_literal(path_name: str) -> Literal["fast", "standard", "deep"]:
+    if path_name == "fast":
+        return "fast"
+    if path_name == "deep":
+        return "deep"
+    return "standard"
+
+
+async def run_unified_pipeline(
+    request: ChatRequest,
+    session_id: str,
+    persistent: bool,
+    queue_event: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    state: Optional[Dict[str, Any]] = None,
+    shell_approval: Optional[bool] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    if not config:
+        raise HTTPException(status_code=400, detail="Configuration not set")
+
+    if state:
+        return await _resume_unified_pipeline(
+            request=request,
+            session_id=session_id,
+            persistent=persistent,
+            state=state,
+            shell_approval=shell_approval,
+            queue_event=queue_event,
+            **kwargs,
+        )
+
+    tracker = PipelineTracker(request_id=str(uuid.uuid4()))
+    session_history, working_memory = build_session_context(session_id)
+    session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
+    skills_list = list_available_skills()
+    skills_index = ", ".join(skills_list) if skills_list else "none"
+    memory_context_text = load_memory_files(["identity.md", "soul.md", "user.md"])
+    history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
+
+    if queue_event:
+        await queue_event("stage", {"name": "meta"})
+
+    with tracker.track_layer("meta", get_model_for_agent("meta")) as metric:
+        metric.input_tokens = TokenCounter.count(session_context, metric.model_used)
+        raw_meta = await run_meta_layer(
+            session_context,
+            skills_index,
+            memory_context_text,
+            working_memory,
+            **kwargs,
+        )
+        metric.output_tokens = TokenCounter.count(str(raw_meta), metric.model_used)
+
+    analysis, warnings = MetaAnalysisParser.parse(raw_meta)
+    execution_path = adaptive_router.route(analysis)
+    tracker.metrics.execution_path = execution_path.name
+
+    if queue_event:
+        await queue_event("meta", {"analysis": analysis.model_dump(), "execution_path": execution_path.name})
+
+    async def queue_stage(layer_name: str) -> None:
+        if queue_event:
+            await queue_event("stage", {"name": layer_name})
+
+    async def planner_callback(context: Dict[str, Any]) -> Dict[str, Any]:
+        planner_result = await run_planner_layer(raw_meta, working_memory, skills_index, **kwargs)
+        if isinstance(planner_result, dict) and planner_result:
+            return planner_result
+        return {"steps": context["analysis"].plan}
+
+    async def reinvoke_meta_callback(reinvoke_prompt: str, message: str) -> MetaAnalysis:
+        del message
+        updated_context = f"{session_context}\n\nREANALYZE INSTRUCTION:\n{reinvoke_prompt}"
+        refreshed = await run_meta_layer(
+            updated_context,
+            skills_index,
+            memory_context_text,
+            working_memory,
+            **kwargs,
+        )
+        refreshed_analysis, refreshed_warnings = MetaAnalysisParser.parse(refreshed)
+        warnings.extend(refreshed_warnings)
+        return refreshed_analysis
+
+    async def executor_callback(context: Dict[str, Any], retry_budget: int) -> Dict[str, Any]:
+        del retry_budget
+        analysis_local: MetaAnalysis = context["analysis"]
+        plan = context.get("plan")
+        if not isinstance(plan, dict):
+            plan = {"steps": analysis_local.plan}
+
+        meta_output = _meta_output_from_analysis(analysis_local, plan=plan)
+        loaded_context = context["memory"].content if isinstance(context.get("memory"), MemoryContext) else ""
+        messages = build_main_messages(
+            request.message,
+            meta_output,
+            history_turns,
+            context.get("sub_agent_results", []),
+            loaded_context=loaded_context,
+        )
+        shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
+        loop_result = await run_tool_loop(
+            config.main,
+            messages,
+            TOOLS_SPEC,
+            approval_mode="ask",
+            allow_shell=shell_allowed,
+            user_message=request.message,
+            **kwargs,
+        )
+
+        if loop_result.get("status") == "needs_approval":
+            pending_calls = loop_result.get("pending_tool_calls", [])
+            resume_state = {
+                "request_message": request.message,
+                "messages": loop_result.get("pending_messages", messages),
+                "tool_calls": pending_calls,
+                "tool_events": loop_result.get("tool_events", []),
+                "subagent_outputs": context.get("sub_agent_results", []),
+                "meta_json": meta_output.model_dump(),
+                "analysis": analysis_local.model_dump(),
+                "execution_path": execution_path.name,
+                "warnings": warnings + context.get("warnings", []),
+                "persistent": persistent,
+            }
+            return {
+                "status": "needs_approval",
+                "reply": "Tool approval required to continue.",
+                "pending_tools": _format_pending_tools(pending_calls),
+                "resume_state": resume_state,
+                "tool_events": format_tool_events_for_response(loop_result.get("tool_events", [])),
+                "sub_agent_results": context.get("sub_agent_results", []),
+            }
+
+        tool_events = loop_result.get("tool_events", [])
+        return {
+            "status": "ok",
+            "reply": loop_result.get("content", ""),
+            "execution": {"response": loop_result.get("content", "")},
+            "tool_events": format_tool_events_for_response(tool_events),
+            "tool_results": [{"name": ev.get("name"), "status": ev.get("status")} for ev in tool_events],
+            "sub_agent_results": context.get("sub_agent_results", []),
+        }
+
+    async def orchestrator_callback(
+        context: Dict[str, Any],
+        analysis_local: MetaAnalysis,
+        retry_budget: int,
+        bus: Optional[ContextBus],
+    ) -> List[Dict[str, Any]]:
+        del retry_budget
+        results: List[Dict[str, Any]] = []
+        for spec in analysis_local.sub_agents_needed:
+            sub_context = ""
+            if bus is not None:
+                view = bus.get_sub_agent_context(spec.task, spec.tools_required)
+                sub_context = (
+                    f"{view.persona_guidelines}\n\n{view.global_plan_summary}\n\n"
+                    + "\n".join([f"- {d.source_agent}: {d.content}" for d in view.sibling_discoveries])
+                )
+            else:
+                sub_context = str(context.get("plan", ""))
+
+            sub_result = await run_v2_subagent(
+                task=spec.task,
+                tools=(spec.tools_required or ["read_file", "regex_search", "edit_file", "memory_search"]),
+                context=sub_context,
+                user_message=request.message,
+                allow_shell=False,
+                approval_mode="auto_deny",
+                **kwargs,
+            )
+            output = {
+                "role": spec.role,
+                "task": spec.task,
+                "result": sub_result.get("result", ""),
+                "tool_events": sub_result.get("tool_events", []),
+                "warnings": sub_result.get("warnings", []),
+            }
+            results.append(output)
+            if bus is not None:
+                bus.report_discovery(spec.role, "result", output["result"])
+        return results
+
+    deps = ExecutionDependencies(
+        planner=planner_callback,
+        executor=executor_callback,
+        orchestrator=orchestrator_callback,
+        reinvoke_meta=reinvoke_meta_callback,
+        queue_stage=queue_stage,
+        model_lookup=get_model_for_agent,
+    )
+
+    execution_result = await execution_engine.execute(
+        path=execution_path,
+        analysis=analysis,
+        message=request.message,
+        tracker=tracker,
+        warnings=warnings,
+        deps=deps,
+    )
+
+    if execution_result.get("status") == "needs_approval":
+        execution_result["execution_path"] = execution_path.name
+        execution_result["meta"] = execution_result.get("meta") or {
+            "analysis": analysis.model_dump(),
+            "warnings": warnings,
+        }
+        execution_result["tracker"] = tracker.finalize()
+        return execution_result
+
+    metrics = tracker.finalize()
+    logger.info(f"Unified pipeline metrics: {metrics}")
+
+    meta = execution_result.get("meta", {})
+    meta["metrics"] = metrics
+    execution_result["meta"] = meta
+
+    store_turn(
+        session_id=session_id,
+        persistent=persistent,
+        user_message=request.message,
+        assistant_reply=execution_result.get("reply", ""),
+        meta_json=meta,
+        tool_events=execution_result.get("tool_events", []),
+        subagent_outputs=execution_result.get("subagent_outputs", []),
+        execution_path=execution_path.name,
+        metrics_json=metrics,
+    )
+    execution_result["session_id"] = session_id
+    execution_result["execution_path"] = execution_path.name
+    return execution_result
+
+
+async def _resume_unified_pipeline(
+    request: ChatRequest,
+    session_id: str,
+    persistent: bool,
+    state: Dict[str, Any],
+    shell_approval: Optional[bool],
+    queue_event: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    messages = state.get("messages", [])
+    tool_calls = state.get("tool_calls", [])
+    tool_events = state.get("tool_events", [])
+    subagent_outputs = state.get("subagent_outputs", [])
+    analysis_raw = state.get("analysis", {})
+    analysis = MetaAnalysis.model_validate(analysis_raw if isinstance(analysis_raw, dict) else {})
+    execution_path_name = state.get("execution_path", "standard")
+    allow_shell = bool(shell_approval)
+    original_user_message = state.get("request_message", request.message)
+
+    for tool_call in tool_calls:
+        fn = tool_call.get("function", {})
+        name = fn.get("name")
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        except Exception:
+            args = {}
+
+        if name == "shell_command" and not allow_shell:
+            result = "DENIED: user requested manual steps instead of running shell_command."
+            status = "denied"
+        elif name == "shell_command":
+            result = await execute_tool(name, args)
+            status = "error" if result.startswith("Tool execution error") else "ok"
+        elif name == "spawn_subagents":
+            outputs = await run_subagents(args.get("subagents", []))
+            subagent_outputs = subagent_outputs + outputs
+            result = json.dumps(outputs, indent=2)
+            status = "ok"
+        else:
+            result = await execute_tool(name, args)
+            status = "error" if result.startswith("Tool execution error") else "ok"
+
+        tool_events.append(
+            {
+                "id": None,
+                "name": name,
+                "args": args,
+                "result": result,
+                "status": status,
+                "created_at": now_iso(),
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.get("id"),
+                "content": result,
+            }
+        )
+
+    loop_result = await run_tool_loop(
+        config.main,
+        messages,
+        TOOLS_SPEC,
+        approval_mode="ask",
+        allow_shell=allow_shell,
+        user_message=original_user_message,
+        **kwargs,
+    )
+
+    if loop_result.get("status") == "needs_approval":
+        pending_calls = loop_result.get("pending_tool_calls", [])
+        new_state = {
+            **state,
+            "messages": loop_result.get("pending_messages", messages),
+            "tool_calls": pending_calls,
+            "tool_events": tool_events + loop_result.get("tool_events", []),
+            "subagent_outputs": subagent_outputs + loop_result.get("subagent_outputs", []),
+        }
+        return {
+            "reply": "Tool approval required to continue.",
+            "meta": {"analysis": analysis.model_dump(), "warnings": state.get("warnings", [])},
+            "tool_events": format_tool_events_for_response(new_state["tool_events"]),
+            "subagent_outputs": new_state["subagent_outputs"],
+            "status": "needs_approval",
+            "pending_tools": _format_pending_tools(pending_calls),
+            "execution_path": execution_path_name,
+            "resume_state": new_state,
+            "session_id": session_id,
+        }
+
+    reply = loop_result.get("content", "")
+    tool_events = tool_events + loop_result.get("tool_events", [])
+    subagent_outputs = subagent_outputs + loop_result.get("subagent_outputs", [])
+
+    path_obj = adaptive_router.PATH_DEFINITIONS.get(execution_path_name, adaptive_router.PATH_DEFINITIONS["standard"])
+    gate_decision = execution_engine.gatekeeper.validate(
+        result={
+            "execution": {"response": reply},
+            "tool_results": [{"status": ev.get("status")} for ev in tool_events],
+            "sub_agent_results": subagent_outputs,
+            "memory_updated": False,
+        },
+        analysis=analysis,
+        path=path_obj,
+    )
+    warnings = state.get("warnings", [])
+    if gate_decision.warnings:
+        warnings = warnings + gate_decision.warnings
+    if gate_decision.issues:
+        warnings = warnings + gate_decision.issues
+
+    memory_updated = False
+    if analysis.memory_actions:
+        memory_updated = execution_engine.memory_loader.apply_memory_actions(analysis.memory_actions)
+
+    tracker = PipelineTracker(request_id=str(uuid.uuid4()))
+    tracker.metrics.execution_path = execution_path_name
+    tracker.increment_tool_calls(len(tool_events))
+    tracker.metrics.sub_agents_spawned = len(subagent_outputs)
+    metrics = tracker.finalize()
+
+    meta = {
+        "analysis": analysis.model_dump(),
+        "warnings": warnings,
+        "gatekeeper": gate_decision.to_dict(),
+        "memory_updated": memory_updated,
+        "metrics": metrics,
+    }
+
+    store_turn(
+        session_id=session_id,
+        persistent=persistent,
+        user_message=original_user_message,
+        assistant_reply=reply,
+        meta_json=meta,
+        tool_events=tool_events,
+        subagent_outputs=subagent_outputs,
+        execution_path=execution_path_name,
+        metrics_json=metrics,
+    )
+
+    if queue_event:
+        await queue_event("stage", {"name": "gatekeeper"})
+
+    return {
+        "reply": reply,
+        "meta": meta,
+        "tool_events": format_tool_events_for_response(tool_events),
+        "subagent_outputs": subagent_outputs,
+        "status": "ok",
+        "execution_path": execution_path_name,
+        "session_id": session_id,
+    }
 
 
 # =============================================================================
@@ -3654,7 +4121,6 @@ async def get_tool_event(event_id: int):
 async def chat_stream(request: ChatRequest):
     logger.debug(f"Config in endpoint: {config}")
     if not config:
-        logger.error("Configuration not set in endpoint")
         raise HTTPException(status_code=400, detail="Configuration not set")
 
     if request.session_id and session_exists(request.session_id):
@@ -3665,328 +4131,73 @@ async def chat_stream(request: ChatRequest):
 
     ensure_session_policy(session_id)
     persistent = session_id not in temp_sessions
+    event_queue: asyncio.Queue = asyncio.Queue()
 
-    event_queue = asyncio.Queue()
-
-    async def queue_event(event, data):
+    async def queue_event(event: str, data: Dict[str, Any]) -> None:
         await event_queue.put((event, data))
 
-    async def on_rate_limit_callback(seconds):
+    async def on_rate_limit_callback(seconds: int) -> None:
         await queue_event("rate_limit_retry", {"seconds": seconds})
 
     async def on_user_decision_callback():
         await queue_event("rate_limit_error", {"session_id": session_id})
         if session_id not in rate_limit_decisions:
             rate_limit_decisions[session_id] = asyncio.Queue()
-        decision = await rate_limit_decisions[session_id].get()
-        return decision
+        return await rate_limit_decisions[session_id].get()
 
     call_kwargs = {
         "on_rate_limit": on_rate_limit_callback,
-        "on_user_decision_required": on_user_decision_callback
+        "on_user_decision_required": on_user_decision_callback,
     }
 
     async def run_orchestration():
         try:
-            architecture_mode = get_architecture_mode()
-            if architecture_mode == "hierarchical_v2":
-                await queue_event("meta", {"architecture_mode": "hierarchical_v2"})
-                v2_result = await run_v2_pipeline(
-                    request=request,
-                    session_id=session_id,
-                    persistent=persistent,
-                    queue_event=queue_event,
-                    **call_kwargs,
-                )
-                if "meta" not in v2_result or not isinstance(v2_result.get("meta"), dict):
-                    v2_result["meta"] = {"architecture_mode": "hierarchical_v2"}
-                if v2_result.get("status") == "needs_approval":
-                    pending_approvals[session_id] = {
-                        "architecture_mode": "hierarchical_v2",
-                        "v2_resume_state": v2_result.get("v2_resume_state"),
-                        "user_message": request.message,
-                        "persistent": persistent,
-                    }
-                    await queue_event("needs_approval", {
-                        "pending_tools": v2_result.get("pending_tools", []),
-                        "meta": v2_result.get("meta"),
-                        "tool_events": v2_result.get("tool_events", []),
-                        "subagent_outputs": v2_result.get("subagent_outputs", []),
-                        "session_id": session_id,
-                        "architecture_mode": "hierarchical_v2",
-                    })
-                    await event_queue.put(None)
-                    return
-                await queue_event("assistant", {
-                    "content": v2_result.get("reply", ""),
-                    "meta": v2_result.get("meta"),
-                    "tool_events": v2_result.get("tool_events", []),
-                    "subagent_outputs": v2_result.get("subagent_outputs", []),
-                    "session_id": session_id,
-                    "architecture_mode": "hierarchical_v2",
-                })
-                await queue_event("done", {"session_id": session_id, "architecture_mode": "hierarchical_v2"})
-                await event_queue.put(None)
-                return
-
-            await queue_event("stage", {"name": "meta_start"})
-            session_history, working_memory = build_session_context(session_id)
-            subagent_outputs: List[Dict[str, Any]] = []
-            # Include current message in context for analysis
-            session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {request.message}"
-
-            skills_list = list_available_skills()
-            skills_index = ", ".join(skills_list) if skills_list else "none"
-            memory_context = load_memory_files(["identity.md", "soul.md", "user.md"])
-
-            # Layer 1+2: Combined Meta + Planner
-            meta_results = await run_meta_layer(
-                session_context,
-                skills_index,
-                memory_context,
-                working_memory,
-                **call_kwargs,
-            )
-            await queue_event("meta_partial", meta_results)
-
-            plan_result = meta_results.get("plan")
-            if not isinstance(plan_result, dict):
-                plan_result = {"just_chat": True, "plan": "respond conversationally"}
-
-            meta_output = MetaOutput(
-                intent=meta_results.get("intent"),
-                tone=meta_results.get("tone"),
-                user=meta_results.get("user"),
-                subject=meta_results.get("subject"),
-                needs=meta_results.get("needs"),
-                patterns=meta_results.get("patterns"),
-                plan=plan_result,
-                raw=meta_results.get("raw")
-            )
-            await queue_event("meta", meta_output.model_dump())
-
-            # Load requested context from planner
-            loaded_context = ""
-            if plan_result.get("load_memories"):
-                for query in plan_result["load_memories"]:
-                    results = await execute_tool("memory_search", {"query": query})
-                    loaded_context += f"Memory search '{query}': {results}\n"
-
-            if plan_result.get("load_skills"):
-                for skill in plan_result["load_skills"]:
-                    content = await execute_tool("skill_load", {"name": skill})
-                    loaded_context += f"Skill '{skill}': {content}\n"
-
-            # Sub agents triggered by planner
-            if plan_result.get("use_sub_agents"):
-                await queue_event("stage", {"name": "subagents_start"})
-                sub_tasks = plan_result.get("sub_agent_tasks", [])
-                sub_specs = [{"role": "subagent", "task": t, "tools": ["shell_command", "memory_search", "memory_create", "read_file"]} for t in sub_tasks]
-                outputs = await run_subagents(sub_specs, **call_kwargs)
-                subagent_outputs.extend(outputs)
-                for output in outputs:
-                    await queue_event("subagent", output)
-                    loaded_context += f"Sub agent task '{output['task']}' result: {output['result']}\n"
-
-            history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
-            messages = build_main_messages(request.message, meta_output, history_turns, subagent_outputs, loaded_context=loaded_context)
-
-            shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
-            tool_events: List[Dict[str, Any]] = []
-            tools_started = False
-
-            for _ in range(MAX_TOOL_ROUNDS):
-                response = await LLMProvider.call(config.main, messages, tools=TOOLS_SPEC, **call_kwargs)
-                assistant_msg = response["choices"][0]["message"]
-                assistant_content = content_to_text(assistant_msg.get("content", ""))
-                tool_calls = assistant_msg.get("tool_calls")
-
-                if tool_calls:
-                    for tool_call in tool_calls:
-                        if not tool_call.get("id"):
-                            tool_call["id"] = f"call_{uuid.uuid4()}"
-
-                    def needs_approval(tc: Dict[str, Any]) -> bool:
-                        fn = tc.get("function", {})
-                        return fn.get("name") == "shell_command"
-
-                    if any(needs_approval(tc) for tc in tool_calls):
-                        pending_messages = messages + [{
-                            "role": "assistant",
-                            "content": assistant_content,
-                            "tool_calls": tool_calls,
-                        }]
-                        pending_approvals[session_id] = {
-                            "messages": pending_messages,
-                            "tool_calls": tool_calls,
-                            "tool_events": tool_events,
-                            "user_message": request.message,
-                            "meta_json": meta_output.model_dump(),
-                            "subagent_outputs": subagent_outputs,
-                            "persistent": persistent,
-                            "architecture_mode": "legacy",
-                        }
-                        pending_tools = [
-                            {
-                                "id": tc.get("id"),
-                                "name": tc.get("function", {}).get("name"),
-                                "arguments": tc.get("function", {}).get("arguments", "{}"),
-                            }
-                            for tc in tool_calls
-                        ]
-                        await queue_event("needs_approval", {
-                            "pending_tools": pending_tools,
-                            "meta": meta_output.model_dump(),
-                            "tool_events": [
-                                {
-                                    "id": ev.get("id"),
-                                    "name": ev["name"],
-                                    "args": ev["args"],
-                                    "status": ev["status"],
-                                    "result": truncate(ev["result"]),
-                                    "created_at": ev["created_at"],
-                                }
-                                for ev in tool_events
-                            ],
-                            "session_id": session_id,
-                            "architecture_mode": "legacy",
-                        })
-                        await event_queue.put(None)
-                        return
-
-                    if not tools_started:
-                        await queue_event("stage", {"name": "tools_start"})
-                        tools_started = True
-
-                    messages.append({
-                        "role": "assistant",
-                        "content": assistant_content,
-                        "tool_calls": tool_calls,
-                    })
-
-                    for tool_call in tool_calls:
-                        fn = tool_call.get("function", {})
-                        name = fn.get("name")
-                        args_raw = fn.get("arguments", "{}")
-                        try:
-                            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                        except Exception:
-                            args = {}
-
-                        await queue_event("tool_call", {"name": name, "args": args})
-
-                        if name == "shell_command" and not shell_allowed:
-                            result = "DENIED: shell_command is not allowed for this agent."
-                            status = "denied"
-                        elif name == "shell_command":
-                            result = await execute_tool(name, args)
-                            status = "error" if result.startswith("Tool execution error") else "ok"
-                        elif name == "spawn_subagents":
-                            await queue_event("stage", {"name": "subagents_start"})
-                            subagents_spec = args.get("subagents", [])
-                            outputs = await run_subagents(subagents_spec, **call_kwargs)
-                            subagent_outputs.extend(outputs)
-                            for output in outputs:
-                                await queue_event("subagent", output)
-                            result = json.dumps(outputs, indent=2)
-                            status = "ok"
-                        else:
-                            result = await execute_tool(name, args)
-                            status = "error" if result.startswith("Tool execution error") else "ok"
-
-                        tool_events.append({
-                            "id": None,
-                            "name": name,
-                            "args": args,
-                            "result": result,
-                            "status": status,
-                            "created_at": now_iso(),
-                        })
-                        await queue_event("tool_result", {
-                            "name": name,
-                            "status": status,
-                            "result": truncate(result),
-                        })
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.get("id"),
-                            "content": result,
-                        })
-                    continue
-
-                reply = assistant_content
-                store_turn(
-                    session_id=session_id,
-                    persistent=persistent,
-                    user_message=request.message,
-                    assistant_reply=reply,
-                    meta_json=meta_output.model_dump(),
-                    tool_events=tool_events,
-                    subagent_outputs=subagent_outputs,
-                )
-                # Layer 5: Gatekeeper
-                await queue_event("stage", {"name": "gatekeeper_start"})
-                user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
-                identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
-                gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md, **call_kwargs)
-                await apply_gatekeeper(session_id, persistent, gate_result)
-                meta_output.gatekeeper = gate_result
-
-                await queue_event("assistant", {
-                    "content": reply,
-                    "meta": meta_output.model_dump(),
-                    "tool_events": [
-                        {
-                            "id": ev.get("id"),
-                            "name": ev["name"],
-                            "args": ev["args"],
-                            "status": ev["status"],
-                            "result": truncate(ev["result"]),
-                            "created_at": ev["created_at"],
-                        }
-                        for ev in tool_events
-                    ],
-                    "subagent_outputs": subagent_outputs,
-                    "session_id": session_id,
-                    "architecture_mode": "legacy",
-                })
-                await queue_event("done", {"session_id": session_id, "architecture_mode": "legacy"})
-                await event_queue.put(None)
-                return
-
-            reply = ""
-            store_turn(
+            result = await run_unified_pipeline(
+                request=request,
                 session_id=session_id,
                 persistent=persistent,
-                user_message=request.message,
-                assistant_reply=reply,
-                meta_json=meta_output.model_dump(),
-                tool_events=tool_events,
-                subagent_outputs=subagent_outputs,
+                queue_event=queue_event,
+                **call_kwargs,
             )
-            await queue_event("assistant", {
-                "content": reply,
-                "meta": meta_output.model_dump(),
-                "tool_events": [
+            if result.get("status") == "needs_approval":
+                pending_approvals[session_id] = {
+                    "resume_state": result.get("resume_state"),
+                    "user_message": request.message,
+                    "persistent": persistent,
+                }
+                await queue_event(
+                    "needs_approval",
                     {
-                        "id": ev.get("id"),
-                        "name": ev["name"],
-                        "args": ev["args"],
-                        "status": ev["status"],
-                        "result": truncate(ev["result"]),
-                        "created_at": ev["created_at"],
-                    }
-                    for ev in tool_events
-                ],
-                "subagent_outputs": subagent_outputs,
-                "session_id": session_id,
-                "architecture_mode": "legacy",
-            })
-            await queue_event("done", {"session_id": session_id, "architecture_mode": "legacy"})
+                        "pending_tools": result.get("pending_tools", []),
+                        "meta": result.get("meta"),
+                        "tool_events": result.get("tool_events", []),
+                        "subagent_outputs": result.get("subagent_outputs", []),
+                        "session_id": session_id,
+                        "execution_path": result.get("execution_path", "standard"),
+                    },
+                )
+                await event_queue.put(None)
+                return
+
+            await queue_event(
+                "assistant",
+                {
+                    "content": result.get("reply", ""),
+                    "meta": result.get("meta"),
+                    "tool_events": result.get("tool_events", []),
+                    "subagent_outputs": result.get("subagent_outputs", []),
+                    "session_id": session_id,
+                    "execution_path": result.get("execution_path", "standard"),
+                },
+            )
+            await queue_event(
+                "done",
+                {"session_id": session_id, "execution_path": result.get("execution_path", "standard")},
+            )
             await event_queue.put(None)
-        except Exception as e:
-            logger.error(f"Error in orchestration: {e}")
-            await queue_event("error", {"detail": str(e)})
+        except Exception as exc:
+            logger.error(f"Error in orchestration: {exc}")
+            await queue_event("error", {"detail": str(exc)})
             await event_queue.put(None)
 
     async def event_generator():
@@ -4019,31 +4230,29 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     ensure_session_policy(session_id)
     persistent = session_id not in temp_sessions
-    if get_architecture_mode() == "hierarchical_v2":
-        v2_result = await run_v2_pipeline(
-            request=request,
-            session_id=session_id,
-            persistent=persistent,
-        )
-        if v2_result.get("status") == "needs_approval":
-            pending_approvals[session_id] = {
-                "architecture_mode": "hierarchical_v2",
-                "v2_resume_state": v2_result.get("v2_resume_state"),
-                "user_message": request.message,
-                "persistent": persistent,
-            }
-        return ChatResponse(
-            reply=v2_result.get("reply", ""),
-            meta=v2_result.get("meta"),
-            tool_events=v2_result.get("tool_events", []),
-            subagent_outputs=v2_result.get("subagent_outputs", []),
-            status=v2_result.get("status", "ok"),
-            pending_tools=v2_result.get("pending_tools"),
-            session_id=v2_result.get("session_id", session_id),
-            architecture_mode="hierarchical_v2",
-        )
+    result = await run_unified_pipeline(
+        request=request,
+        session_id=session_id,
+        persistent=persistent,
+    )
 
-    return await run_legacy_pipeline(request, session_id, persistent)
+    if result.get("status") == "needs_approval":
+        pending_approvals[session_id] = {
+            "resume_state": result.get("resume_state"),
+            "user_message": request.message,
+            "persistent": persistent,
+        }
+
+    return ChatResponse(
+        reply=result.get("reply", ""),
+        meta=result.get("meta"),
+        tool_events=result.get("tool_events", []),
+        subagent_outputs=result.get("subagent_outputs", []),
+        status=result.get("status", "ok"),
+        pending_tools=result.get("pending_tools"),
+        session_id=result.get("session_id", session_id),
+        execution_path=_execution_path_literal(result.get("execution_path", "standard")),
+    )
 
 
 @app.post("/api/tools/approve")
@@ -4052,192 +4261,38 @@ async def approve_tools(request: ToolApprovalRequest) -> ChatResponse:
         raise HTTPException(status_code=404, detail="No pending tool approval")
 
     pending = pending_approvals.pop(request.session_id)
+    resume_state = pending.get("resume_state")
+    if not isinstance(resume_state, dict):
+        raise HTTPException(status_code=400, detail="Missing unified resume state")
+
     original_user_message = pending.get("user_message", "(tool approval continuation)")
     persistent = pending.get("persistent", request.session_id not in temp_sessions)
-    architecture_mode = pending.get("architecture_mode", "legacy")
+    allow_shell = request.decision in {"run_once", "allow_session"}
 
-    allow_shell = request.decision in ["run_once", "allow_session"]
-
-    if architecture_mode == "hierarchical_v2":
-        resume_state = pending.get("v2_resume_state")
-        if not isinstance(resume_state, dict):
-            raise HTTPException(status_code=400, detail="Missing v2 resume state")
-
-        v2_result = await run_v2_pipeline(
-            request=ChatRequest(message=original_user_message, session_id=request.session_id),
-            session_id=request.session_id,
-            persistent=persistent,
-            state=resume_state,
-            shell_approval=allow_shell,
-        )
-
-        if v2_result.get("status") == "needs_approval":
-            pending_approvals[request.session_id] = {
-                "architecture_mode": "hierarchical_v2",
-                "v2_resume_state": v2_result.get("v2_resume_state"),
-                "user_message": original_user_message,
-                "persistent": persistent,
-            }
-            return ChatResponse(
-                reply=v2_result.get("reply", "Tool approval required to continue."),
-                meta=v2_result.get("meta"),
-                tool_events=v2_result.get("tool_events", []),
-                subagent_outputs=v2_result.get("subagent_outputs", []),
-                status="needs_approval",
-                pending_tools=v2_result.get("pending_tools", []),
-                session_id=request.session_id,
-                architecture_mode="hierarchical_v2",
-            )
-
-        return ChatResponse(
-            reply=v2_result.get("reply", ""),
-            meta=v2_result.get("meta"),
-            tool_events=v2_result.get("tool_events", []),
-            subagent_outputs=v2_result.get("subagent_outputs", []),
-            status=v2_result.get("status", "ok"),
-            pending_tools=v2_result.get("pending_tools"),
-            session_id=request.session_id,
-            architecture_mode="hierarchical_v2",
-        )
-
-    messages = pending["messages"]
-    tool_calls = pending["tool_calls"]
-    tool_events = pending["tool_events"]
-    meta_json = pending.get("meta_json", {})
-    subagent_outputs = pending.get("subagent_outputs", [])
-
-    for tool_call in tool_calls:
-        fn = tool_call.get("function", {})
-        name = fn.get("name")
-        args_raw = fn.get("arguments", "{}")
-        try:
-            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-        except Exception:
-            args = {}
-
-        if name == "shell_command" and not allow_shell:
-            result = "DENIED: user requested manual steps instead of running shell_command."
-            status = "denied"
-        elif name == "shell_command":
-            result = await execute_tool(name, args)
-            status = "error" if result.startswith("Tool execution error") else "ok"
-        elif name == "spawn_subagents":
-            outputs = await run_subagents(args.get("subagents", []))
-            subagent_outputs = subagent_outputs + outputs
-            result = json.dumps(outputs, indent=2)
-            status = "ok"
-        else:
-            result = await execute_tool(name, args)
-            status = "error" if result.startswith("Tool execution error") else "ok"
-
-        tool_events.append({
-            "id": None,
-            "name": name,
-            "args": args,
-            "result": result,
-            "status": status,
-            "created_at": now_iso(),
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.get("id"),
-            "content": result,
-        })
-
-    loop_result = await run_tool_loop(
-        config.main,
-        messages,
-        TOOLS_SPEC,
-        approval_mode="ask",
-        allow_shell=allow_shell,
-        user_message=original_user_message,
-    )
-
-    if loop_result["status"] == "needs_approval":
-        pending_approvals[request.session_id] = {
-            "messages": loop_result["pending_messages"],
-            "tool_calls": loop_result["pending_tool_calls"],
-            "tool_events": tool_events + loop_result.get("tool_events", []),
-            "user_message": original_user_message,
-            "meta_json": meta_json,
-            "subagent_outputs": subagent_outputs + loop_result.get("subagent_outputs", []),
-            "persistent": persistent,
-            "architecture_mode": architecture_mode,
-        }
-        pending_tools = [
-            {
-                "id": tc.get("id"),
-                "name": tc.get("function", {}).get("name"),
-                "arguments": tc.get("function", {}).get("arguments", "{}"),
-            }
-            for tc in loop_result["pending_tool_calls"]
-        ]
-        return ChatResponse(
-            reply="Tool approval required to continue.",
-            meta=meta_json,
-            tool_events=[
-                {
-                    "id": ev.get("id"),
-                    "name": ev["name"],
-                    "args": ev["args"],
-                    "status": ev["status"],
-                    "result": truncate(ev["result"]),
-                    "created_at": ev["created_at"],
-                }
-                for ev in tool_events
-            ],
-            subagent_outputs=subagent_outputs + loop_result.get("subagent_outputs", []),
-            status="needs_approval",
-            pending_tools=pending_tools,
-            session_id=request.session_id,
-            architecture_mode=architecture_mode,
-        )
-
-    reply = loop_result.get("content", "")
-    tool_events.extend(loop_result.get("tool_events", []))
-    subagent_outputs = subagent_outputs + loop_result.get("subagent_outputs", [])
-
-    store_turn(
+    result = await run_unified_pipeline(
+        request=ChatRequest(message=original_user_message, session_id=request.session_id),
         session_id=request.session_id,
         persistent=persistent,
-        user_message=original_user_message,
-        assistant_reply=reply,
-        meta_json=meta_json,
-        tool_events=tool_events,
-        subagent_outputs=subagent_outputs,
-        architecture_mode=architecture_mode,
+        state=resume_state,
+        shell_approval=allow_shell,
     )
 
-    if architecture_mode == "legacy":
-        # Layer 5: Gatekeeper (legacy only)
-        session_history, _ = build_session_context(request.session_id)
-        session_context = f"{session_history}\n\nCURRENT USER MESSAGE: {original_user_message}"
-        user_md = (MEMORY_DIR / "user.md").read_text() if (MEMORY_DIR / "user.md").exists() else ""
-        identity_md = (MEMORY_DIR / "identity.md").read_text() if (MEMORY_DIR / "identity.md").exists() else ""
-        gate_result = await run_gatekeeper_layer(session_context, reply, user_md, identity_md)
-        await apply_gatekeeper(request.session_id, persistent, gate_result)
-
-        if isinstance(meta_json, dict):
-            meta_json["gatekeeper"] = gate_result
+    if result.get("status") == "needs_approval":
+        pending_approvals[request.session_id] = {
+            "resume_state": result.get("resume_state"),
+            "user_message": original_user_message,
+            "persistent": persistent,
+        }
 
     return ChatResponse(
-        reply=reply,
-        meta=meta_json,
-        tool_events=[
-            {
-                "id": ev.get("id"),
-                "name": ev["name"],
-                "args": ev["args"],
-                "status": ev["status"],
-                "result": truncate(ev["result"]),
-                "created_at": ev["created_at"],
-            }
-            for ev in tool_events
-        ],
-        subagent_outputs=subagent_outputs,
-        status="ok",
-        session_id=request.session_id,
-        architecture_mode=architecture_mode,
+        reply=result.get("reply", ""),
+        meta=result.get("meta"),
+        tool_events=result.get("tool_events", []),
+        subagent_outputs=result.get("subagent_outputs", []),
+        status=result.get("status", "ok"),
+        pending_tools=result.get("pending_tools"),
+        session_id=result.get("session_id", request.session_id),
+        execution_path=_execution_path_literal(result.get("execution_path", "standard")),
     )
 
 

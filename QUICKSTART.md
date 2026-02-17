@@ -37,10 +37,10 @@ python main.py
 - **Model**: `llama3-70b-8192`
 - **API Key**: Your Groq API key
 
-### Architecture Mode
-- `legacy` keeps the original meta/planner pipeline
-- `hierarchical_v2` enables Main + Summarizer + Orchestrator + Sub-Agent strict `[TOOL]` syntax flow
-- `hierarchical_v2` now includes loop guards to auto-stop repeated failing actions
+### Execution Path
+- Runtime selects `fast`, `standard`, or `deep` automatically per turn
+- `deep` enables sub-agent orchestration when complexity is high
+- Responses include `execution_path` so you can inspect routing decisions
 
 4. Click **Save Configuration**
 5. Click **Chat** and start chatting!
@@ -73,7 +73,6 @@ You can create, rename, and resume sessions from the Sessions panel.
 
 ```json
 {
-  "architecture_mode": "legacy",
   "meta": {
     "provider": "Groq",
     "provider_type": "openai_compatible",
@@ -167,7 +166,7 @@ Have a few conversations, then say:
 **Tool execution fails**
 → Check file paths and permissions
 
-**hierarchical_v2 seems stuck**
+**Pipeline seems stuck**
 → Check tool result warnings in Details; repeated failing actions are auto-finished and surfaced there
 
 **Tool approval required**

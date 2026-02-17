@@ -1,28 +1,27 @@
 {
-  "architecture_mode": "legacy",
-  "meta": {
-    "provider": "OpenAI",
-    "model": "gpt-4",
-    "api_key": "dummy-key"
-  },
-  "main": {
-    "provider": "OpenAI",
-    "model": "gpt-4",
-    "api_key": "dummy-key"
-  },
-  "sub": {
-    "provider": "OpenAI",
-    "model": "gpt-4",
-    "api_key": "dummy-key"
-  },
-  "orchestrator": {
-    "provider": "OpenAI",
-    "model": "gpt-4",
-    "api_key": "dummy-key"
-  },
-  "summarizer": {
-    "provider": "OpenAI",
-    "model": "gpt-4",
-    "api_key": "dummy-key"
-  }
+    "meta":  {
+                 "provider":  "OpenAI",
+                 "model":  "gpt-4",
+                 "api_key":  "dummy-key"
+             },
+    "main":  {
+                 "provider":  "OpenAI",
+                 "model":  "gpt-4",
+                 "api_key":  "dummy-key"
+             },
+    "sub":  {
+                "provider":  "OpenAI",
+                "model":  "gpt-4",
+                "api_key":  "dummy-key"
+            },
+    "orchestrator":  {
+                         "provider":  "OpenAI",
+                         "model":  "gpt-4",
+                         "api_key":  "dummy-key"
+                     },
+    "summarizer":  {
+                       "provider":  "OpenAI",
+                       "model":  "gpt-4",
+                       "api_key":  "dummy-key"
+                   }
 }
