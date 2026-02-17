@@ -41,31 +41,7 @@ This system uses a unified adaptive pipeline with three execution paths:
 - `standard` for normal multi-step turns
 - `deep` for complex turns and sub-agent orchestration
 
-```text
-         User Input
-             ↓
-┌───────────────────────────┐
-│  Layer 1: Meta-Analysis   │ (Intent, Tone, User, Subject, Needs, Patterns)
-└─────────────┬─────────────┘
-              ↓ (Structured Analysis)
-┌─────────────┴─────────────┐
-│  Layer 2: System Planner  │ (Strategy, Memory Actions, Sub-agent Tasks)
-└─────────────┬─────────────┘
-              ↓ (Strategic Plan)
-┌─────────────┴─────────────┐
-│    Layer 3: Main Agent    │ (Tool Use, Context Integration, User Response)
-└─────────────┬─────────────┘
-              ↓ (If Complex)
-┌─────────────┴─────────────┐
-│   Layer 4: Sub-Agents     │ (Parallel Focused Tasks)
-└─────────────┬─────────────┘
-              ↓ (Execution Results)
-┌─────────────┴─────────────┐
-│   Layer 5: Gatekeeper     │ (Turn Summary, Memory Evolution, Validation)
-└─────────────┬─────────────┘
-              ↓
-        User Response
-```
+![Pipeline](static/pipeline.svg)
 
 ---
 
