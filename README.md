@@ -33,31 +33,33 @@ Unlike traditional chatbots that provide generic, forgettable interactions, Open
 
 ## 🏗️ Architecture
 
-OpenAgent supports **dual architecture modes** to handle everything from simple chats to complex engineering tasks:
+This system uses a unified adaptive pipeline with three execution paths:
 
-1.  **Hierarchical_v2 (Recommended):** A strict structure consisting of a Main Agent, optional Summarizer, Orchestrator, and Sub-Agents with loop guards to prevent recursive failures.
-2.  **Legacy (5-Layer Pipeline):** A sophisticated sequential flow:
+- `fast` for low-complexity turns
+- `standard` for normal multi-step turns
+- `deep` for complex turns and sub-agent orchestration
 
 ```text
-User Input ↓
+         User Input
+             ↓
 ┌───────────────────────────┐
-│  Layer 1: Meta-Analysis   │ (Intent, Tone, Patterns)
+│  Layer 1: Meta-Analysis   │ (Intent, Tone, User, Subject, Needs, Patterns)
 └─────────────┬─────────────┘
-              ↓
+              ↓ (Structured Analysis)
 ┌─────────────┴─────────────┐
-│  Layer 2: System Planner  │ (Strategy, Memory, Sub-agents)
+│  Layer 2: System Planner  │ (Strategy, Memory Actions, Sub-agent Tasks)
 └─────────────┬─────────────┘
-              ↓
+              ↓ (Strategic Plan)
 ┌─────────────┴─────────────┐
-│   Layer 3: Main Agent     │ (Tool Use, User Response)
+│    Layer 3: Main Agent    │ (Tool Use, Context Integration, User Response)
 └─────────────┬─────────────┘
               ↓ (If Complex)
 ┌─────────────┴─────────────┐
 │   Layer 4: Sub-Agents     │ (Parallel Focused Tasks)
 └─────────────┬─────────────┘
-              ↓
+              ↓ (Execution Results)
 ┌─────────────┴─────────────┐
-│   Layer 5: Gatekeeper     │ (Summary, Memory Evolution)
+│   Layer 5: Gatekeeper     │ (Turn Summary, Memory Evolution, Validation)
 └─────────────┬─────────────┘
               ↓
         User Response
