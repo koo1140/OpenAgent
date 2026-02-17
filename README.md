@@ -9,14 +9,14 @@ OpenAgent is not just a chatbot; it is an intelligent framework built on the pri
 <img width="1918" height="913" alt="image" src="https://github.com/koo1140/OpenAgent/blob/main/547248235-0298b148-3327-4bee-9ecd-981ba20caeb7.png?raw=true" />
 ---
 ## Guide
-- [Meta-Cognitive Intelligence](#the-secret-sauce-meta-cognitive-intelligence)
-- [Architecture](#architecture)
-- [Adaptive Memory System](#adaptive-memory-system)
-- [Key Features](#key-features)
-- [Installation & Setup](#installation--setup)
-- [Repository Structure](#repository-structure)
-- [Contributing](#contributing)
-- [License](#license)
+- [Meta-Cognitive Intelligence](#-the-secret-sauce-meta-cognitive-intelligence)
+- [Architecture](#-architecture)
+- [Adaptive Memory System](#-adaptive-memory-system)
+- [Key Features](#-key-features)
+- [Installation & Setup](#-installation--setup)
+- [Repository Structure](#-repository-structure)
+- [Contributing](#-contributing)
+- [License](#-license)
 
 ## 🧠 The "Secret Sauce": Meta-Cognitive Intelligence
 
