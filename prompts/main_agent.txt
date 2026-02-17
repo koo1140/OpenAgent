@@ -69,6 +69,7 @@ Use `read_file` when needed:
 - `memory/user.md`
 - `skills/<skill_name>.md`
 For large files, prefer `read_file` with `mode="structure"`, `mode="window"`, or `mode="tail"`.
+When persistent-memory tags suggest relevant identity/preferences/history, call `memory_search` with `query` and `tags` before answering.
 
 ## TOOLS YOU HAVE
 

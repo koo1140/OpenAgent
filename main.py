@@ -1261,19 +1261,26 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             return f"Memory saved (id: {memory['id']})"
 
         if name == "memory_search":
-            query = arguments.get("query", "").lower()
+            query = str(arguments.get("query", "")).strip().lower()
             tags = arguments.get("tags", [])
+            tag_filter = {str(tag).strip().lower() for tag in tags} if isinstance(tags, list) else set()
+            if not query and not tag_filter:
+                return "Tool validation error: memory_search requires non-empty query or tags"
             content = PERSISTENT_MEMORY_PATH.read_text()
             data = json.loads(content)
             results = []
             for m in data["memories"]:
                 score = 0
-                if query in m["content"].lower():
+                content_text = str(m.get("content", "")).lower()
+                if query and query in content_text:
                     score += 1
-                if tags:
-                    for t in tags:
-                        if t in m.get("tags", []):
-                            score += 1
+                if tag_filter:
+                    memory_tags = {
+                        str(tag).strip().lower()
+                        for tag in m.get("tags", [])
+                    } if isinstance(m.get("tags", []), list) else set()
+                    overlap = len(memory_tags & tag_filter)
+                    score += overlap
                 if score > 0:
                     results.append(m)
 
@@ -1377,6 +1384,65 @@ def render_persistent_memory_snapshot(limit: int = 20, max_item_chars: int = 220
                 content = content[:max_item_chars] + f"... ({len(content)} chars)"
             lines.append(f"- id={mem_id} | category={category} | tags={tags_text} | content={content}")
         return "\n".join(lines) if lines else "None"
+    except Exception:
+        return "Unavailable"
+
+
+def render_persistent_memory_index(
+    max_tags: int = 40,
+    max_recent: int = 6,
+    max_item_chars: int = 120,
+) -> str:
+    try:
+        if not PERSISTENT_MEMORY_PATH.exists():
+            return "None"
+        payload = json.loads(PERSISTENT_MEMORY_PATH.read_text(encoding="utf-8-sig"))
+        memories = payload.get("memories", [])
+        if not isinstance(memories, list) or not memories:
+            return "None"
+
+        tag_counts: Dict[str, int] = {}
+        category_counts: Dict[str, int] = {}
+        for memory in memories:
+            if not isinstance(memory, dict):
+                continue
+            category = str(memory.get("category", "semantic")).strip() or "semantic"
+            category_counts[category] = category_counts.get(category, 0) + 1
+            tags = memory.get("tags", [])
+            if isinstance(tags, list):
+                for tag in tags:
+                    tag_text = str(tag).strip().lower()
+                    if not tag_text:
+                        continue
+                    tag_counts[tag_text] = tag_counts.get(tag_text, 0) + 1
+
+        sorted_tags = sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))
+        sorted_categories = sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+
+        tag_text = ", ".join([f"{tag}({count})" for tag, count in sorted_tags[:max_tags]]) if sorted_tags else "none"
+        category_text = ", ".join([f"{cat}({count})" for cat, count in sorted_categories]) if sorted_categories else "none"
+
+        recent_lines: List[str] = []
+        for memory in memories[-max_recent:]:
+            if not isinstance(memory, dict):
+                continue
+            mem_id = memory.get("id", "?")
+            tags = memory.get("tags", [])
+            tags_text = ", ".join([str(tag) for tag in tags[:6]]) if isinstance(tags, list) and tags else "-"
+            content = str(memory.get("content", "")).replace("\n", " ").strip()
+            if len(content) > max_item_chars:
+                content = content[:max_item_chars] + "..."
+            recent_lines.append(f"- id={mem_id} | tags={tags_text} | content={content}")
+
+        lines = [
+            f"Memory count: {len(memories)}",
+            f"Categories: {category_text}",
+            f"Top tags: {tag_text}",
+        ]
+        if recent_lines:
+            lines.append("Recent memory hints:")
+            lines.extend(recent_lines)
+        return "\n".join(lines)
     except Exception:
         return "Unavailable"
 
@@ -1975,7 +2041,8 @@ def build_main_messages(
     meta_output: MetaOutput,
     history_turns: List[Dict[str, Any]],
     subagent_outputs: List[Dict[str, Any]],
-    loaded_context: str = ""
+    loaded_context: str = "",
+    persistent_memory_index: str = "",
 ) -> List[Dict[str, Any]]:
     main_prompt = load_main_agent_prompt()
 
@@ -1995,6 +2062,13 @@ def build_main_messages(
         f"Available memory files: {memory_text}. Use read_file to load if needed.",
         f"Available skills: {skills_text}. Use read_file to load if needed.",
     ]
+    if persistent_memory_index and persistent_memory_index not in {"None", "Unavailable"}:
+        system_parts.append(
+            "Persistent memory index (tag-level, compact):\n"
+            f"{persistent_memory_index}\n"
+            "If user asks about identity/preferences/history and confidence is low, call memory_search "
+            "with query + tags before final answer."
+        )
     if extra_instructions:
         system_parts.append(f"Instruction from Planner:\n{extra_instructions}")
 
@@ -3655,6 +3729,7 @@ async def run_unified_pipeline(
     skills_list = list_available_skills()
     skills_index = ", ".join(skills_list) if skills_list else "none"
     memory_context_text = load_memory_files(["identity.md", "soul.md", "user.md"])
+    persistent_memory_index = render_persistent_memory_index(max_tags=40, max_recent=6, max_item_chars=120)
     history_turns = get_recent_turns(session_id, MAX_HISTORY_TURNS)
 
     if queue_event:
@@ -3717,6 +3792,7 @@ async def run_unified_pipeline(
             history_turns,
             context.get("sub_agent_results", []),
             loaded_context=loaded_context,
+            persistent_memory_index=persistent_memory_index,
         )
         shell_allowed = session_policies[session_id].get("shell_command_allowed", False)
         loop_result = await run_tool_loop(
