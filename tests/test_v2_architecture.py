@@ -12,6 +12,7 @@ from main import (
     parse_agent_action,
     parse_subagent_tag,
     parse_tool_tag,
+    render_persistent_memory_snapshot,
     resolve_tool_path,
     resolve_agent_config,
     run_tool_loop,
@@ -145,6 +146,50 @@ async def test_execute_v2_tool_memory_write_not_semantically_rejected(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_execute_v2_tool_memory_create_accepts_type_alias(monkeypatch):
+    captured = {}
+
+    async def fake_execute_tool(name, arguments):
+        captured["name"] = name
+        captured["arguments"] = arguments
+        return "Memory saved (id: 3)"
+
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+    outcome = await execute_v2_tool(
+        "memory_create",
+        {"type": "preference", "content": "User prefers male pronouns for assistant."},
+        user_message="remember this",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "ok"
+    assert captured["name"] == "memory_create"
+    assert captured["arguments"]["category"] == "semantic"
+    assert "type" not in captured["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_memory_create_accepts_attribute_value_alias(monkeypatch):
+    captured = {}
+
+    async def fake_execute_tool(name, arguments):
+        captured["name"] = name
+        captured["arguments"] = arguments
+        return "Memory saved (id: 4)"
+
+    monkeypatch.setattr("main.execute_tool", fake_execute_tool)
+    outcome = await execute_v2_tool(
+        "memory_create",
+        {"attribute": "name", "value": "OpenAgent"},
+        user_message="remember this",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "ok"
+    assert captured["arguments"]["content"] == "name: OpenAgent"
+    assert "attribute" not in captured["arguments"]
+    assert "value" not in captured["arguments"]
+
+
+@pytest.mark.asyncio
 async def test_execute_v2_tool_shell_denied_terminal():
     outcome = await execute_v2_tool(
         "shell_command",
@@ -190,6 +235,38 @@ async def test_execute_v2_tool_accepts_legacy_edit_file_shape(tmp_path):
     assert outcome["terminal"] is False
     assert "Successfully edited" in outcome["message"]
     assert target.read_text() == "Assistant Name: OpenAgent"
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_tool_rejects_memory_file_overwrite_without_explicit_flag(monkeypatch, tmp_path):
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    identity = memory_dir / "identity.md"
+    identity.write_text("original identity")
+
+    monkeypatch.setattr("main.MEMORY_DIR", memory_dir)
+
+    outcome = await execute_v2_tool(
+        "edit_file",
+        {"file_path": "identity.md", "content": "name: OpenAgent"},
+        user_message="x",
+        allow_shell=False,
+    )
+    assert outcome["status"] == "rejected"
+    assert "refusing to overwrite memory file" in outcome["message"]
+    assert identity.read_text() == "original identity"
+
+
+def test_render_persistent_memory_snapshot_formats_recent_items(monkeypatch, tmp_path):
+    path = tmp_path / "persistent.json"
+    path.write_text(
+        '{"memories":[{"id":1,"content":"alpha","category":"semantic","tags":["pref"]},{"id":2,"content":"beta","category":"episodic","tags":[]}]}'
+    )
+    monkeypatch.setattr("main.PERSISTENT_MEMORY_PATH", path)
+    rendered = render_persistent_memory_snapshot(limit=2)
+    assert "id=1" in rendered
+    assert "content=alpha" in rendered
+    assert "id=2" in rendered
 
 
 @pytest.mark.asyncio

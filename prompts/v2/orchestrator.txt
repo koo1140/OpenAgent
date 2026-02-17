@@ -36,6 +36,8 @@ You are responsible for planning and execution.
 - Keep memory writes specific and factual.
 - Prefer durable user preferences, constraints, and goals.
 - For standard memory saves, use `memory_create`; use `edit_file` only when the task explicitly requires file editing.
+- `memory_create` contract: use `content` (+ optional `category`, `tags`). Legacy aliases `type`, `attribute`, `value` may exist but `content` is preferred.
+- Do not overwrite memory markdown files with `edit_file` write mode unless overwrite is explicitly intended.
 
 ## Completion Rule
 When all steps are complete, you must call FINISH with JSON payload fields:

@@ -679,6 +679,7 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                     "replace": {"type": "string", "description": "Replacement text for search"},
                     "regex": {"type": "boolean", "description": "Whether search is regex (default true)"},
                     "max_replacements": {"type": "integer", "description": "Maximum number of replacements; default 1"},
+                    "overwrite": {"type": "boolean", "description": "Allow full overwrite of existing file in write mode"},
                     "mode": {"type": "string", "enum": ["write", "append"], "description": "Write mode"},
                 },
                 "required": ["path"],
@@ -758,6 +759,9 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
                     "content": {"type": "string", "description": "The content to save"},
                     "category": {"type": "string", "enum": ["episodic", "semantic", "procedural"], "description": "Memory category"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for the memory"},
+                    "type": {"type": "string", "description": "Legacy alias for memory category"},
+                    "attribute": {"type": "string", "description": "Legacy field used with value to construct content"},
+                    "value": {"type": "string", "description": "Legacy field used as content or with attribute"},
                 },
                 "required": ["content"],
             },
@@ -896,6 +900,32 @@ def normalize_and_validate_tool_arguments(name: str, arguments: Dict[str, Any]) 
             if alias_path is not None:
                 args["path"] = alias_path
 
+    if name == "memory_create":
+        # Compatibility aliases used by older prompts and model outputs.
+        if "category" not in args and args.get("type") is not None:
+            args["category"] = args.get("type")
+        if "content" not in args:
+            attribute = args.get("attribute")
+            value = args.get("value")
+            if attribute is not None and value is not None:
+                args["content"] = f"{attribute}: {value}"
+            elif value is not None:
+                args["content"] = str(value)
+
+        category_value = args.get("category")
+        if isinstance(category_value, str):
+            mapped_category = {
+                "preference": "semantic",
+                "preferences": "semantic",
+                "profile": "semantic",
+                "fact": "semantic",
+                "memory": "semantic",
+                "event": "episodic",
+                "procedure": "procedural",
+            }.get(category_value.strip().lower())
+            if mapped_category:
+                args["category"] = mapped_category
+
     unknown = sorted([key for key in args.keys() if key not in props])
     if unknown:
         return None, f"unexpected parameter(s) for {name}: {', '.join(unknown)}"
@@ -924,6 +954,11 @@ def normalize_and_validate_tool_arguments(name: str, arguments: Dict[str, Any]) 
     if name in {"read_file", "edit_file"}:
         normalized.pop("file_path", None)
         normalized.pop("file", None)
+
+    if name == "memory_create":
+        normalized.pop("type", None)
+        normalized.pop("attribute", None)
+        normalized.pop("value", None)
 
     if name == "edit_file":
         has_content = "content" in normalized
@@ -1051,6 +1086,13 @@ def resolve_tool_path(raw_path: str) -> Path:
     return path
 
 
+def is_path_within(path: Path, base_dir: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(base_dir.resolve())
+    except Exception:
+        return False
+
+
 async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     try:
         normalized_args, validation_error = normalize_and_validate_tool_arguments(name, arguments)
@@ -1124,6 +1166,17 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = arguments.get("mode", "write")
             content = arguments.get("content", "")
+            overwrite = arguments.get("overwrite", False)
+            if (
+                mode == "write"
+                and path.exists()
+                and is_path_within(path, MEMORY_DIR)
+                and not overwrite
+            ):
+                return (
+                    "Tool validation error: refusing to overwrite memory file in write mode; "
+                    "use search/replace or pass overwrite=true"
+                )
             if mode == "append":
                 with open(path, "a") as file:
                     file.write(content)
@@ -1271,6 +1324,72 @@ def load_memory_files(files: List[str]) -> str:
         if path.exists():
             content.append(f"=== {filename.upper()} ===\n{path.read_text()}\n")
     return "\n".join(content)
+
+
+def render_persistent_memory_snapshot(limit: int = 20, max_item_chars: int = 220) -> str:
+    try:
+        if not PERSISTENT_MEMORY_PATH.exists():
+            return "None"
+        payload = json.loads(PERSISTENT_MEMORY_PATH.read_text())
+        memories = payload.get("memories", [])
+        if not isinstance(memories, list) or not memories:
+            return "None"
+        selected = memories[-limit:]
+        lines: List[str] = []
+        for memory in selected:
+            if not isinstance(memory, dict):
+                continue
+            mem_id = memory.get("id", "?")
+            category = memory.get("category", "semantic")
+            tags = memory.get("tags", [])
+            tags_text = ", ".join([str(tag) for tag in tags]) if isinstance(tags, list) and tags else "-"
+            content = str(memory.get("content", ""))
+            content = content.replace("\n", " ").strip()
+            if len(content) > max_item_chars:
+                content = content[:max_item_chars] + f"... ({len(content)} chars)"
+            lines.append(f"- id={mem_id} | category={category} | tags={tags_text} | content={content}")
+        return "\n".join(lines) if lines else "None"
+    except Exception:
+        return "Unavailable"
+
+
+def render_tool_contracts(tool_names: List[str]) -> str:
+    schemas = tool_schema_by_name()
+    lines: List[str] = []
+    seen: set[str] = set()
+    has_memory_create = False
+    has_edit_file = False
+    for name in tool_names:
+        tool_name = (name or "").strip()
+        if not tool_name or tool_name in seen:
+            continue
+        seen.add(tool_name)
+        if tool_name == "summarizer":
+            lines.append("- summarizer: required=[query] optional=[none]")
+            continue
+        if tool_name == "orchestrator":
+            lines.append("- orchestrator: required=[tasks] optional=[context]")
+            continue
+        if tool_name == "FINISH":
+            lines.append("- FINISH: [TOOL]FINISH(result=\"{\\\"summary\\\":\\\"...\\\",\\\"critical_facts\\\":[],\\\"artifact_ids\\\":[]}\")[/TOOL]")
+            continue
+        schema = schemas.get(tool_name, {})
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = schema.get("required", []) if isinstance(schema, dict) else []
+        required_text = ", ".join(required) if required else "-"
+        optional_names = [key for key in props.keys() if key not in set(required)]
+        optional_text = ", ".join(optional_names) if optional_names else "-"
+        lines.append(f"- {tool_name}: required=[{required_text}] optional=[{optional_text}]")
+        if tool_name == "memory_create":
+            has_memory_create = True
+        if tool_name == "edit_file":
+            has_edit_file = True
+    if has_memory_create:
+        lines.append("- memory_create aliases accepted: type->category, attribute+value->content, value->content.")
+    if has_edit_file:
+        lines.append("- edit_file modes: path+content (write/append) OR path+search+replace (patch).")
+        lines.append("- edit_file guard: memory/*.md overwrite in write mode needs overwrite=true.")
+    return "\n".join(lines)
 
 
 def load_skills(files: List[str]) -> str:
@@ -2426,7 +2545,9 @@ async def run_v2_subagent(
         system_prompt = (
             f"{prompt}\n\n"
             "Syntax is case-sensitive.\n"
-            f"Allowed tools for this task: {', '.join(allowed_tools)}"
+            f"Allowed tools for this task: {', '.join(allowed_tools)}\n\n"
+            "Tool contracts:\n"
+            f"{render_tool_contracts(allowed_tools)}"
         )
         state = {
             "task": task,
@@ -2670,7 +2791,15 @@ async def run_v2_orchestrator(
             "allow_shell": allow_shell,
             "allowed_tool_names": v2_known_tool_names() + ["FINISH"],
             "messages": [
-                {"role": "system", "content": f"{prompt}\n\nSyntax is case-sensitive."},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{prompt}\n\n"
+                        "Syntax is case-sensitive.\n\n"
+                        "Tool contracts:\n"
+                        f"{render_tool_contracts(v2_known_tool_names() + ['FINISH'])}"
+                    ),
+                },
                 {"role": "user", "content": f"tasks:\n{tasks}\n\ncontext:\n{context or ''}"},
             ],
             "tool_events": [],
@@ -2993,6 +3122,7 @@ async def run_v2_pipeline(
         if (MEMORY_DIR / "identity.md").exists():
             memory_files.append("identity.md")
         memory_context = load_memory_files(memory_files)
+        persistent_snapshot = render_persistent_memory_snapshot(limit=20)
 
         main_prompt = load_v2_prompt("main_agent.txt", "You are Main Agent.")
         messages: List[Dict[str, Any]] = [
@@ -3002,7 +3132,10 @@ async def run_v2_pipeline(
                     f"{main_prompt}\n\n"
                     "Syntax is case-sensitive.\n"
                     "Main can only call summarizer or orchestrator.\n\n"
-                    f"Memory context:\n{memory_context}"
+                    "Tool contracts:\n"
+                    f"{render_tool_contracts(['summarizer', 'orchestrator'])}\n\n"
+                    f"Memory context (files):\n{memory_context}\n\n"
+                    f"Persistent memory snapshot (most recent):\n{persistent_snapshot}"
                 ),
             }
         ]
