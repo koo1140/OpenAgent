@@ -439,7 +439,7 @@ Main Agent coordinates their work and integrates results.
 ## File Structure
 
 ```
-agentic-gateway/
+OpenAgent/
 ├── main.py                 # FastAPI backend
 ├── index.html             # Frontend interface
 ├── requirements.txt       # Python dependencies
