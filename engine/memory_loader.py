@@ -73,7 +73,7 @@ class SemanticMemoryRetriever:
 
 
 class MemoryLoader:
-    MEMORY_DIR = Path("memory")
+    MEMORY_DIR = Path(__file__).resolve().parents[1] / "memory"
     SUMMARY_PATTERN = re.compile(r"<!-- SUMMARY_START -->(.*?)<!-- SUMMARY_END -->", flags=re.DOTALL)
 
     def __init__(self) -> None:

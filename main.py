@@ -41,11 +41,13 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # =============================================================================
 
-DB_PATH = Path("sessions.db")
-CONFIG_PATH = Path("config.json")
-MEMORY_DIR = Path("memory")
-PROMPTS_DIR = Path("prompts")
-SKILLS_DIR = Path("skills")
+BASE_DIR = Path(__file__).resolve().parent
+
+DB_PATH = BASE_DIR / "sessions.db"
+CONFIG_PATH = BASE_DIR / "config.json"
+MEMORY_DIR = BASE_DIR / "memory"
+PROMPTS_DIR = BASE_DIR / "prompts"
+SKILLS_DIR = BASE_DIR / "skills"
 
 PERSISTENT_MEMORY_PATH = MEMORY_DIR / "persistent.json"
 SKILLS_INDEX_PATH = SKILLS_DIR / "skills.json"
@@ -1102,12 +1104,12 @@ def resolve_tool_path(raw_path: str) -> Path:
     if path.is_absolute():
         return path
     if path.parent != Path("."):
-        return path
+        return (BASE_DIR / path).resolve()
 
     memory_candidate = MEMORY_DIR / path.name
     if memory_candidate.exists() or path.name in {"identity.md", "user.md", "soul.md"}:
         return memory_candidate
-    return path
+    return (BASE_DIR / path).resolve()
 
 
 def is_path_within(path: Path, base_dir: Path) -> bool:
@@ -1331,7 +1333,7 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
 
 def load_prompt(path: Path, default: str) -> str:
     if path.exists():
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     return default
 
 
@@ -1813,15 +1815,15 @@ async def run_meta_layer(
     **kwargs
 ) -> Dict[str, Any]:
     meta_agents = {
-        "intent": "prompts/meta_intent.txt",
-        "tone": "prompts/meta_tone.txt",
-        "user": "prompts/meta_user.txt",
-        "subject": "prompts/meta_subject.txt",
-        "needs": "prompts/meta_needs.txt",
-        "patterns": "prompts/meta_patterns.txt",
+        "intent": PROMPTS_DIR / "meta_intent.txt",
+        "tone": PROMPTS_DIR / "meta_tone.txt",
+        "user": PROMPTS_DIR / "meta_user.txt",
+        "subject": PROMPTS_DIR / "meta_subject.txt",
+        "needs": PROMPTS_DIR / "meta_needs.txt",
+        "patterns": PROMPTS_DIR / "meta_patterns.txt",
     }
-    
-    planner_prompt = Path("prompts/planner.txt").read_text()
+
+    planner_prompt = (PROMPTS_DIR / "planner.txt").read_text(encoding="utf-8")
 
     combined_prompt = (
         "You are a meta-analysis and planning system.\n"
@@ -1830,7 +1832,7 @@ async def run_meta_layer(
         "The 'plan' key must be an object.\n\n"
     )
     for name, path in meta_agents.items():
-        prompt = Path(path).read_text()
+        prompt = path.read_text(encoding="utf-8")
         if name == "needs":
             prompt = prompt.replace("{skills_index}", skills_index)
         combined_prompt += f"--- {name.upper()} ---\n{prompt}\n\n"
@@ -1898,7 +1900,7 @@ async def run_meta_layer(
         return results
 
 async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, skills_index: str, **kwargs) -> Dict[str, Any]:
-    prompt = Path("prompts/planner.txt").read_text()
+    prompt = (PROMPTS_DIR / "planner.txt").read_text(encoding="utf-8")
     context = f"META ANALYSIS:\n{json.dumps(meta_output, indent=2)}\n\nWORKING MEMORY:\n{working_memory}\n\nAVAILABLE SKILLS:\n{skills_index}"
 
     messages = [
@@ -1916,7 +1918,7 @@ async def run_planner_layer(meta_output: Dict[str, Any], working_memory: str, sk
         return {"error": str(e), "just_chat": True, "plan": "respond conversationally"}
 
 async def run_gatekeeper_layer(conversation: str, agent_response: str, user_md: str, identity_md: str, **kwargs) -> Dict[str, Any]:
-    prompt = Path("prompts/gatekeeper.txt").read_text()
+    prompt = (PROMPTS_DIR / "gatekeeper.txt").read_text(encoding="utf-8")
     context = f"CONVERSATION:\n{conversation}\n\nAGENT RESPONSE:\n{agent_response}\n\nCURRENT USER.MD:\n{user_md}\n\nCURRENT IDENTITY.MD:\n{identity_md}"
 
     messages = [
@@ -4306,7 +4308,7 @@ async def chat_decision(session_id: str = Body(embed=True), decision: str = Body
 
 @app.get("/")
 async def serve_frontend():
-    return FileResponse("index.html")
+    return FileResponse(BASE_DIR / "index.html")
 
 
 if __name__ == "__main__":
